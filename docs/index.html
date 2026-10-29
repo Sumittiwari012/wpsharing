@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>WhatsApp Connection Setup (Baileys)</title>
+<style>
+  body { font-family: system-ui, sans-serif; text-align: center; padding: 40px; background: #f5f6f8; }
+  h2 { color: #222; }
+  #qr-img { width: 280px; height: 280px; margin-top: 20px; border: 1px solid #ddd; border-radius: 8px; background: #fff; padding: 10px; }
+  .status-ready { color: #28a745; font-weight: bold; font-size: 1.1rem; }
+  .status-waiting { color: #555; }
+  input { padding: 8px; width: 320px; margin-bottom: 15px; border-radius: 4px; border: 1px solid #ccc; }
+</style>
+</head>
+<body>
+  <h2>WhatsApp Service Connection (Baileys)</h2>
+  <p>Service URL:</p>
+  <input id="serviceUrl" value="https://lightsalmon-pigeon-313595.hostingersite.com" />
+  <div id="status" class="status-waiting">Checking status...</div>
+  <button id="disconnectBtn" style="display:none; padding: 8px 16px; margin-top: 10px; background: #dc3545; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">
+    Disconnect WhatsApp
+  </button>
+  <div><img id="qr-img" style="display:none;" /></div>
+
+  <div id="send-box" style="display:none; margin-top: 30px; text-align: left; max-width: 340px; margin-left: auto; margin-right: auto; background: #fff; padding: 20px; border-radius: 8px; border: 1px solid #ddd;">
+    <h3 style="margin-top:0;">Send a Message</h3>
+
+    <label style="font-size: 0.85rem; color: #555;">Phone Number</label>
+    <input id="phoneNumber" placeholder="e.g. 9876543210 or 919876543210" style="width: 100%; box-sizing: border-box;" />
+
+    <label style="font-size: 0.85rem; color: #555;">Message</label>
+    <textarea id="messageText" rows="4" placeholder="Type your message..." style="width: 100%; box-sizing: border-box; padding: 8px; border-radius: 4px; border: 1px solid #ccc; font-family: inherit;"></textarea>
+
+    <button id="sendBtn" style="width: 100%; padding: 10px; margin-top: 10px; background: #25D366; color: #fff; border: none; border-radius: 4px; font-weight: bold; cursor: pointer;">
+      Send via WhatsApp
+    </button>
+
+    <div id="sendResult" style="margin-top: 12px; font-size: 0.9rem;"></div>
+  </div>
+
+  <div id="pdf-box" style="display:none; margin-top: 20px; text-align: left; max-width: 340px; margin-left: auto; margin-right: auto; background: #fff; padding: 20px; border-radius: 8px; border: 1px solid #ddd;">
+    <h3 style="margin-top:0;">Test PDF Invoice Send (/send-invoice)</h3>
+
+    <label style="font-size: 0.85rem; color: #555;">Phone Number</label>
+    <input id="pdfPhoneNumber" placeholder="e.g. 9876543210 or 919876543210" style="width: 100%; box-sizing: border-box;" />
+
+    <label style="font-size: 0.85rem; color: #555;">Invoice Number (optional)</label>
+    <input id="pdfInvoiceNumber" placeholder="e.g. GS170720260001" style="width: 100%; box-sizing: border-box;" />
+
+    <label style="font-size: 0.85rem; color: #555;">Customer Name (optional)</label>
+    <input id="pdfCustomerName" placeholder="e.g. Rahul" style="width: 100%; box-sizing: border-box;" />
+
+    <label style="font-size: 0.85rem; color: #555;">PDF File</label>
+    <input id="pdfFile" type="file" accept="application/pdf" style="width: 100%; box-sizing: border-box;" />
+
+    <button id="sendPdfBtn" style="width: 100%; padding: 10px; margin-top: 10px; background: #007bff; color: #fff; border: none; border-radius: 4px; font-weight: bold; cursor: pointer;">
+      Send PDF via WhatsApp
+    </button>
+
+    <div id="pdfSendResult" style="margin-top: 12px; font-size: 0.9rem;"></div>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const qrImg = document.getElementById('qr-img');
+    const urlInput = document.getElementById('serviceUrl');
+    const sendBox = document.getElementById('send-box');
+    const sendResult = document.getElementById('sendResult');
+    const pdfBox = document.getElementById('pdf-box');
+    const pdfSendResult = document.getElementById('pdfSendResult');
+    const disconnectBtn = document.getElementById('disconnectBtn');
+
+    async function poll() {
+      const base = urlInput.value.replace(/\/$/, '');
+      try {
+        const res = await fetch(`${base}/qr-status`);
+        const data = await res.json();
+
+        if (data.ready) {
+          statusEl.textContent = '✅ Connected and ready';
+          statusEl.className = 'status-ready';
+          qrImg.style.display = 'none';
+          sendBox.style.display = 'block';
+          pdfBox.style.display = 'block';
+          disconnectBtn.style.display = 'inline-block';
+        } else if (data.qr) {
+          statusEl.textContent = 'Scan this QR from WhatsApp → Linked Devices';
+          statusEl.className = 'status-waiting';
+          qrImg.src = data.qr;
+          qrImg.style.display = 'inline-block';
+          sendBox.style.display = 'none';
+          pdfBox.style.display = 'none';
+          disconnectBtn.style.display = 'none';
+        } else {
+          statusEl.textContent = 'Waiting for QR code to generate...';
+          qrImg.style.display = 'none';
+          sendBox.style.display = 'none';
+          pdfBox.style.display = 'none';
+          disconnectBtn.style.display = 'none';
+        }
+      } catch (err) {
+        statusEl.textContent = '⚠️ Cannot reach service at this URL';
+        qrImg.style.display = 'none';
+        sendBox.style.display = 'none';
+        pdfBox.style.display = 'none';
+        disconnectBtn.style.display = 'none';
+      }
+    }
+
+    document.getElementById('sendBtn').addEventListener('click', async () => {
+      const base = urlInput.value.replace(/\/$/, '');
+      const phoneNumber = document.getElementById('phoneNumber').value.trim();
+      const message = document.getElementById('messageText').value.trim();
+
+      if (!phoneNumber || !message) {
+        sendResult.style.color = '#dc3545';
+        sendResult.textContent = 'Please fill in phone number and message.';
+        return;
+      }
+
+      sendResult.style.color = '#555';
+      sendResult.textContent = 'Sending...';
+
+      try {
+        const res = await fetch(`${base}/send-text`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ phoneNumber, message })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+          sendResult.style.color = '#28a745';
+          sendResult.textContent = '✅ ' + data.message;
+        } else {
+          sendResult.style.color = '#dc3545';
+          sendResult.textContent = '❌ ' + data.message;
+        }
+      } catch (err) {
+        sendResult.style.color = '#dc3545';
+        sendResult.textContent = '⚠️ Could not reach service: ' + err.message;
+      }
+    });
+
+    document.getElementById('sendPdfBtn').addEventListener('click', async () => {
+      const base = urlInput.value.replace(/\/$/, '');
+      const phoneNumber = document.getElementById('pdfPhoneNumber').value.trim();
+      const invoiceNumber = document.getElementById('pdfInvoiceNumber').value.trim();
+      const customerName = document.getElementById('pdfCustomerName').value.trim();
+      const fileInput = document.getElementById('pdfFile');
+      const file = fileInput.files[0];
+
+      if (!phoneNumber || !file) {
+        pdfSendResult.style.color = '#dc3545';
+        pdfSendResult.textContent = 'Please fill in phone number and choose a PDF file.';
+        return;
+      }
+
+      pdfSendResult.style.color = '#555';
+      pdfSendResult.textContent = 'Sending...';
+
+      try {
+        const formData = new FormData();
+        formData.append('phoneNumber', phoneNumber);
+        formData.append('invoiceNumber', invoiceNumber);
+        formData.append('customerName', customerName);
+        formData.append('invoicePdf', file);
+
+        const res = await fetch(`${base}/send-invoice`, {
+          method: 'POST',
+          body: formData // no Content-Type header — the browser sets the multipart boundary itself
+        });
+        const data = await res.json();
+
+        if (data.success) {
+          pdfSendResult.style.color = '#28a745';
+          pdfSendResult.textContent = '✅ ' + data.message;
+        } else {
+          pdfSendResult.style.color = '#dc3545';
+          pdfSendResult.textContent = '❌ ' + data.message;
+        }
+      } catch (err) {
+        pdfSendResult.style.color = '#dc3545';
+        pdfSendResult.textContent = '⚠️ Could not reach service: ' + err.message;
+      }
+    });
+
+    disconnectBtn.addEventListener('click', async () => {
+      const base = urlInput.value.replace(/\/$/, '');
+      if (!confirm('Disconnect this WhatsApp number? You will need to scan a new QR code to reconnect.')) {
+        return;
+      }
+      disconnectBtn.disabled = true;
+      disconnectBtn.textContent = 'Disconnecting...';
+      try {
+        const res = await fetch(`${base}/logout`, { method: 'POST' });
+        const data = await res.json();
+        if (!data.success) {
+          alert('❌ ' + data.message);
+        }
+      } catch (err) {
+        alert('⚠️ Could not reach service: ' + err.message);
+      } finally {
+        disconnectBtn.disabled = false;
+        disconnectBtn.textContent = 'Disconnect WhatsApp';
+        poll(); // refresh status right away — a new QR should appear shortly
+      }
+    });
+
+    setInterval(poll, 2000);
+    poll();
+  </script>
+</body>
+</html>
