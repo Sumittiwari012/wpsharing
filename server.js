@@ -30,7 +30,8 @@ const app = express();
 
 // Hardcoded frontend domain — no CORS_ORIGIN environment variable needed.
 const ALLOWED_ORIGINS = [
-  'https://gripstylepos.netlify.app'
+    'https://sumittiwari012.github.io',
+    'https://gripstylepos.netlify.app'
 ];
 
 const corsOptions = {
