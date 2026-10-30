@@ -120,12 +120,32 @@ async function initDb() {
     created_at BIGINT NOT NULL,
     KEY idx_user (user_id)
   ) ${T}`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS assignments (
-    chat_id VARCHAR(80) PRIMARY KEY,
+
+  // One row per time a staff member handled a chat. This is both the "who owns it now" table
+  // (status = 'active') and the history that feeds the admin dashboard.
+  //   status: active | cleared (order done) | cancelled | transferred | released (sent back to inbox)
+  // active_chat is set to chat_id only while active and is UNIQUE, so two people can never claim the same chat.
+  await pool.query(`CREATE TABLE IF NOT EXISTS handlings (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    chat_id VARCHAR(80) NOT NULL,
     user_id INT NOT NULL,
-    assigned_at BIGINT NOT NULL,
-    KEY idx_user (user_id)
+    status VARCHAR(12) NOT NULL DEFAULT 'active',
+    active_chat VARCHAR(80) NULL,
+    started_at BIGINT NOT NULL,
+    closed_at BIGINT NULL,
+    note VARCHAR(255) NULL,
+    transferred_from INT NULL,
+    UNIQUE KEY uniq_active (active_chat),
+    KEY idx_chat (chat_id),
+    KEY idx_user_status (user_id, status)
   ) ${T}`);
+  // One-time migration from the old admin-driven "assignments" table (ignored if it does not exist)
+  try {
+    await pool.query(`INSERT IGNORE INTO handlings (chat_id, user_id, status, active_chat, started_at)
+                      SELECT chat_id, user_id, 'active', chat_id, assigned_at FROM assignments`);
+    await pool.query('DROP TABLE assignments');
+  } catch (_) { /* nothing to migrate */ }
+
   try { await pool.query('ALTER TABLE messages ADD COLUMN sent_by INT NULL'); } catch (_) { /* column already exists */ }
 
   // Login is by WhatsApp number (email is no longer needed)
@@ -239,7 +259,7 @@ function chatRowToJson(r) {
     lastMessageTime: r.last_message_time || 0,
     pinned: !!r.pinned,
     archived: !!r.archived,
-    assignedTo: assignedInfo(r.id),
+    assignedTo: assignedInfo(r.id), // who is handling it right now (null = nobody, sits in the common inbox)
     lastMessage: last
   };
 }
@@ -398,19 +418,30 @@ function toJid(phoneNumber) {
   return `${number}@s.whatsapp.net`;
 }
 
+const deny = (chatId) => {
+  const o = assignedInfo(chatId);
+  return Object.assign(new Error(o ? `Not allowed: ${o.name} is handling this chat` : 'Claim this chat first'), { status: 403 });
+};
+
+// Who may send into a chat?  The coworker who claimed it, or the admin.
+// Typing a brand-new phone number in "My chats" claims it automatically if nobody has it yet.
 async function resolveTarget(input, user) {
   if (!input) throw Object.assign(new Error('chatId / phoneNumber is required'), { status: 400 });
-  const deny = () => Object.assign(new Error('Not allowed: this chat is not assigned to you'), { status: 403 });
+  const check = async (jid, autoClaim) => {
+    if (!user || canSend(user, jid)) return;
+    if (autoClaim && !assignMap.has(jid) && (await claimChat(jid, user.id))) return;
+    throw deny(jid);
+  };
   if (String(input).includes('@')) {
-    if (user && !canAccess(user, String(input))) throw deny();
+    await check(String(input), false);
     return String(input);
   }
   const jid = toJid(input);
-  if (user && !canAccess(user, jid)) throw deny();
-  const [check] = await sock.onWhatsApp(jid);
-  if (!check?.exists) throw Object.assign(new Error('This number is not registered on WhatsApp'), { status: 400 });
-  const final = check.jid || jid;
-  if (user && !canAccess(user, final)) throw deny();
+  if (user && assignMap.has(jid)) await check(jid, false);
+  const [found] = await sock.onWhatsApp(jid);
+  if (!found?.exists) throw Object.assign(new Error('This number is not registered on WhatsApp'), { status: 400 });
+  const final = found.jid || jid;
+  await check(final, true);
   return final;
 }
 
@@ -461,7 +492,7 @@ const safe = (fn) => async (...args) => {
 const requireReady = (req, res, next) =>
   isReady ? next() : res.status(503).json({ success: false, message: 'WhatsApp not connected yet' });
 
-/* ───────────────────────── auth, roles & assignments ───────────────────────── */
+/* ───────────────────────── auth, roles & chat ownership ───────────────────────── */
 
 const digits = (v) => String(v || '').replace(/\D/g, '');
 const normPhone = (v) => { let n = digits(v); if (n.length === 10) n = '91' + n; return n; };
@@ -474,7 +505,7 @@ const safeEq = (a, b) => {
 
 const OTP_TTL = 5 * 60 * 1000;
 const SESSION_TTL = 7 * 24 * 3600 * 1000;
-const assignMap = new Map();   // chat jid -> coworker user id
+const assignMap = new Map();   // chat jid -> user id of the coworker handling it right now
 const usersCache = new Map();  // user id -> { id, name, email, phone, role, active }
 const otpMsgIds = new Set();   // OTP messages we sent over WhatsApp (not stored as chats)
 
@@ -482,26 +513,91 @@ async function loadCaches() {
   const [users] = await pool.query('SELECT id, name, email, phone, role, active FROM users');
   usersCache.clear();
   users.forEach((u) => usersCache.set(u.id, u));
-  const [rows] = await pool.query('SELECT chat_id, user_id FROM assignments');
+  const [rows] = await pool.query("SELECT chat_id, user_id FROM handlings WHERE status='active'");
   assignMap.clear();
   rows.forEach((a) => assignMap.set(a.chat_id, a.user_id));
 }
 
-const canAccess = (user, chatId) => user.role === 'admin' || assignMap.get(chatId) === user.id;
-const guard = (req, chatId) => {
-  if (!canAccess(req.user, chatId)) throw Object.assign(new Error('Not allowed: this chat is not assigned to you'), { status: 403 });
+// Anyone logged in can READ any chat. Only the coworker handling it (or the admin) can SEND / change it.
+const canSend = (user, chatId) => user.role === 'admin' || assignMap.get(chatId) === user.id;
+const guardSend = (req, chatId) => {
+  if (!canSend(req.user, chatId)) throw deny(chatId);
 };
 const assignedInfo = (chatId) => {
   const u = usersCache.get(assignMap.get(chatId));
   return u ? { id: u.id, name: u.name } : null;
 };
 
-// Events about a chat go only to admins and to the coworker it is assigned to
+// Take a chat. Atomic: the UNIQUE key on active_chat means only one person can win.
+async function claimChat(chatId, userId) {
+  try {
+    await pool.query("INSERT INTO handlings (chat_id, user_id, status, active_chat, started_at) VALUES (?,?,'active',?,?)", [chatId, userId, chatId, Date.now()]);
+  } catch (e) {
+    if (e.code === 'ER_DUP_ENTRY') return false;
+    throw e;
+  }
+  assignMap.set(chatId, userId);
+  return true;
+}
+
+// Finish the current handling with a status (cleared / cancelled / released). Returns rows changed.
+async function endHandling(chatId, status, note) {
+  const [r] = await pool.query(
+    'UPDATE handlings SET status=?, active_chat=NULL, closed_at=?, note=? WHERE active_chat=?',
+    [status, Date.now(), note ? String(note).slice(0, 255) : null, chatId]
+  );
+  assignMap.delete(chatId);
+  return r.affectedRows;
+}
+
+// Send back to the common inbox. We bump unread to 1 so it shows up there again (the inbox lists unread chats).
+async function releaseChat(chatId) {
+  const n = await endHandling(chatId, 'released');
+  if (n) await pool.query('UPDATE chats SET unread_count = GREATEST(unread_count, 1) WHERE id=?', [chatId]);
+  return n;
+}
+
+async function releaseAllOf(userId) {
+  const [rows] = await pool.query("SELECT chat_id FROM handlings WHERE user_id=? AND status='active'", [userId]);
+  for (const r of rows) {
+    await releaseChat(r.chat_id);
+    await emitChat(r.chat_id);
+  }
+}
+
+async function transferChat(chatId, toUserId) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [cur] = await conn.query('SELECT id, user_id FROM handlings WHERE active_chat=? FOR UPDATE', [chatId]);
+    if (!cur[0]) { await conn.rollback(); return false; }
+    const now = Date.now();
+    await conn.query("UPDATE handlings SET status='transferred', active_chat=NULL, closed_at=? WHERE id=?", [now, cur[0].id]);
+    await conn.query(
+      "INSERT INTO handlings (chat_id, user_id, status, active_chat, started_at, transferred_from) VALUES (?,?,'active',?,?,?)",
+      [chatId, toUserId, chatId, now, cur[0].user_id]
+    );
+    await conn.commit();
+    assignMap.set(chatId, toUserId);
+    return true;
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+}
+
+async function markRead(chatId) {
+  const [rows] = await pool.query('SELECT raw FROM messages WHERE chat_id=? AND from_me=0 ORDER BY ts DESC LIMIT 100', [chatId]);
+  const keys = rows.map((r) => JSON.parse(r.raw, BufferJSON.reviver).key);
+  if (keys.length && sock && isReady) await sock.readMessages(keys);
+  await upsertChat(chatId, { unreadCount: 0 });
+}
+
+// Every logged-in person sees the same live updates (inbox, "handled by" tags, new messages)
 function emitToChat(chatId, event, payload) {
-  let room = io.to('admin');
-  const uid = assignMap.get(chatId);
-  if (uid) room = room.to('user:' + uid);
-  room.emit(event, payload);
+  io.emit(event, payload);
 }
 
 async function userFromToken(token) {
@@ -665,6 +761,7 @@ async function startSock() {
       for (const id of ids) {
         await pool.query('DELETE FROM messages WHERE chat_id=?', [id]);
         await pool.query('DELETE FROM chats WHERE id=?', [id]);
+        await endHandling(id, 'released');
         emitToChat(id, 'chat-deleted', id);
       }
     }));
@@ -790,7 +887,64 @@ app.post('/auth/logout', wrap(async (req, res) => {
 
 app.get('/qr-status', requireAdmin, (req, res) => res.json({ ready: isReady, qr: isReady ? null : latestQr }));
 
-// ── admin: coworkers & assignments ──
+// Active coworkers: the "predefined list" everybody can pick from when transferring a chat
+app.get('/team', wrap(async (req, res) => {
+  const [rows] = await pool.query("SELECT id, name, role, active FROM users WHERE role='agent' AND active=1 ORDER BY name");
+  res.json({ success: true, users: rows });
+}));
+
+/* ───────────────────────── handling a chat: claim / close / transfer / release ───────────────────────── */
+
+// Take a chat from the common inbox. Whoever is first wins; everybody else sees "handled by <name>".
+app.post('/chats/claim', wrap(async (req, res) => {
+  const { chatId } = req.body;
+  if (!chatId) return res.status(400).json({ success: false, message: 'chatId is required' });
+  const [ex] = await pool.query('SELECT 1 FROM chats WHERE id=?', [chatId]);
+  if (!ex[0]) return res.status(404).json({ success: false, message: 'Chat not found' });
+  if (assignMap.get(chatId) === req.user.id) return res.json({ success: true });
+  if (!(await claimChat(chatId, req.user.id))) {
+    const o = assignedInfo(chatId);
+    return res.status(409).json({ success: false, message: o ? `${o.name} is already handling this chat` : 'Could not claim this chat' });
+  }
+  await markRead(chatId).catch((e) => console.warn('mark read failed:', e.message));
+  await emitChat(chatId);
+  res.json({ success: true });
+}));
+
+// Order finished: outcome = "cleared" (order done) or "cancelled". The chat leaves your list.
+app.post('/chats/close', wrap(async (req, res) => {
+  const { chatId, outcome, note } = req.body;
+  if (!['cleared', 'cancelled'].includes(outcome)) return res.status(400).json({ success: false, message: 'outcome must be "cleared" or "cancelled"' });
+  guardSend(req, chatId);
+  if (!(await endHandling(chatId, outcome, note))) return res.status(404).json({ success: false, message: 'Nobody is handling this chat' });
+  await emitChat(chatId);
+  res.json({ success: true });
+}));
+
+// Hand over to another coworker: the chat moves from your list to theirs.
+app.post('/chats/transfer', wrap(async (req, res) => {
+  const { chatId } = req.body;
+  const to = Number(req.body.userId);
+  guardSend(req, chatId);
+  const t = usersCache.get(to);
+  if (!t || t.role === 'admin' || !t.active) return res.status(400).json({ success: false, message: 'Choose an active coworker' });
+  if (assignMap.get(chatId) === to) return res.status(400).json({ success: false, message: 'That coworker already has this chat' });
+  if (!(await transferChat(chatId, to))) return res.status(404).json({ success: false, message: 'Nobody is handling this chat' });
+  await emitChat(chatId);
+  res.json({ success: true });
+}));
+
+// Put back into the common inbox without a result tag
+app.post('/chats/release', wrap(async (req, res) => {
+  const { chatId } = req.body;
+  guardSend(req, chatId);
+  if (!(await releaseChat(chatId))) return res.status(404).json({ success: false, message: 'Nobody is handling this chat' });
+  await emitChat(chatId);
+  res.json({ success: true });
+}));
+
+/* ───────────────────────── admin: team & dashboard ───────────────────────── */
+
 const dropAccess = async (id) => {
   await pool.query('DELETE FROM sessions WHERE user_id=?', [id]);
   io.in('user:' + id).disconnectSockets(true);
@@ -799,7 +953,7 @@ const dropAccess = async (id) => {
 app.get('/admin/users', requireAdmin, wrap(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT u.id, u.name, u.email, u.phone, u.role, u.active,
-            (SELECT COUNT(*) FROM assignments a WHERE a.user_id = u.id) AS chats
+            (SELECT COUNT(*) FROM handlings h WHERE h.user_id = u.id AND h.status = 'active') AS chats
        FROM users u ORDER BY u.role, u.name`
   );
   res.json({ success: true, users: rows });
@@ -830,7 +984,10 @@ app.patch('/admin/users/:id', requireAdmin, wrap(async (req, res) => {
   if (b.phone !== undefined) { sets.push('phone=?'); vals.push(normPhone(b.phone) || null); }
   if (b.active !== undefined) { sets.push('active=?'); vals.push(b.active ? 1 : 0); }
   if (sets.length) await pool.query(`UPDATE users SET ${sets.join(',')} WHERE id=?`, [...vals, id]);
-  if (b.active !== undefined && !b.active) await dropAccess(id);
+  if (b.active !== undefined && !b.active) {
+    await dropAccess(id);
+    await releaseAllOf(id); // their chats go back to the common inbox
+  }
   await loadCaches();
   res.json({ success: true });
 }));
@@ -840,40 +997,54 @@ app.delete('/admin/users/:id', requireAdmin, wrap(async (req, res) => {
   const u = usersCache.get(id);
   if (!u || u.role === 'admin') return res.status(404).json({ success: false, message: 'Coworker not found' });
   await dropAccess(id);
-  await pool.query('DELETE FROM assignments WHERE user_id=?', [id]);
-  await pool.query('DELETE FROM users WHERE id=?', [id]);
+  await releaseAllOf(id);
+  await pool.query('DELETE FROM users WHERE id=?', [id]); // handling history stays for the dashboard
   await loadCaches();
   res.json({ success: true });
 }));
 
-// Body: { chatId | phoneNumber, userId }  (userId null = unassign)
-app.post('/admin/assign', requireAdmin, wrap(async (req, res) => {
-  const { chatId, phoneNumber } = req.body;
-  const userId = req.body.userId == null || req.body.userId === '' ? null : Number(req.body.userId);
-  const jid = chatId || (phoneNumber ? toJid(phoneNumber) : null);
-  if (!jid) return res.status(400).json({ success: false, message: 'chatId or phoneNumber is required' });
-  if (userId != null) {
-    const u = usersCache.get(userId);
-    if (!u || u.role === 'admin' || !u.active) return res.status(400).json({ success: false, message: 'Choose an active coworker' });
-  }
-  const old = assignMap.get(jid);
-  if (userId == null) await pool.query('DELETE FROM assignments WHERE chat_id=?', [jid]);
-  else await pool.query('REPLACE INTO assignments (chat_id, user_id, assigned_at) VALUES (?,?,?)', [jid, userId, Date.now()]);
-  await loadCaches();
-  if (old && old !== userId) io.to('user:' + old).emit('chat-deleted', jid);
-  await emitChat(jid);
-  res.json({ success: true, chatId: jid });
-}));
-
-app.get('/admin/assignments', requireAdmin, wrap(async (req, res) => {
+// Dashboard: per coworker how many chats they follow right now and how many ended as order cleared / cancelled.
+// ?days=N limits the closed counts to the last N days (0 = all time).
+app.get('/admin/stats', requireAdmin, wrap(async (req, res) => {
+  const days = Math.max(0, Number(req.query.days) || 0);
+  const since = days ? Date.now() - days * 864e5 : 0;
   const [rows] = await pool.query(
-    `SELECT a.chat_id, a.user_id, COALESCE(ct.name, c.name, ct.notify) AS name
-       FROM assignments a LEFT JOIN chats c ON c.id = a.chat_id LEFT JOIN contacts ct ON ct.id = a.chat_id
-      ORDER BY a.assigned_at DESC`
+    `SELECT u.id, u.name, u.phone, u.active,
+            (SELECT COUNT(*) FROM handlings a WHERE a.user_id = u.id AND a.status = 'active') AS following,
+            COALESCE(SUM(h.status = 'cleared'), 0) AS cleared,
+            COALESCE(SUM(h.status = 'cancelled'), 0) AS cancelled,
+            COALESCE(SUM(h.status = 'transferred'), 0) AS transferred
+       FROM users u
+       LEFT JOIN handlings h ON h.user_id = u.id AND h.status <> 'active' AND h.closed_at >= ?
+      WHERE u.role = 'agent'
+      GROUP BY u.id
+      ORDER BY u.name`,
+    [since]
   );
-  res.json({ success: true, assignments: rows.map((r) => ({ chatId: r.chat_id, userId: r.user_id, name: r.name || '+' + numberFromJid(r.chat_id) })) });
+  const [recent] = await pool.query(
+    `SELECT h.id, h.chat_id, h.status, h.started_at, h.closed_at,
+            u.name AS user_name, COALESCE(ct.name, c.name, ct.notify) AS name
+       FROM handlings h
+       LEFT JOIN users u ON u.id = h.user_id
+       LEFT JOIN chats c ON c.id = h.chat_id
+       LEFT JOIN contacts ct ON ct.id = h.chat_id
+      ORDER BY COALESCE(h.closed_at, h.started_at) DESC
+      LIMIT 40`
+  );
+  const unclaimed = (await getChats()).filter((c) => c.unreadCount > 0 && !c.assignedTo).length;
+  res.json({
+    success: true,
+    unclaimed,
+    agents: rows.map((r) => ({
+      id: r.id, name: r.name, phone: r.phone, active: !!r.active,
+      following: Number(r.following), cleared: Number(r.cleared), cancelled: Number(r.cancelled), transferred: Number(r.transferred)
+    })),
+    recent: recent.map((r) => ({
+      id: r.id, chatId: r.chat_id, status: r.status, startedAt: r.started_at, closedAt: r.closed_at,
+      user: r.user_name || 'Removed user', name: r.name || '+' + numberFromJid(r.chat_id)
+    }))
+  });
 }));
-
 
 app.post('/whatsapp/logout', requireAdmin, wrap(async (req, res) => {
   try { await sock.logout(); } catch (e) { console.warn('sock.logout() error (continuing):', e.message); }
@@ -882,19 +1053,23 @@ app.post('/whatsapp/logout', requireAdmin, wrap(async (req, res) => {
   await fs.promises.rm(MEDIA_DIR, { recursive: true, force: true });
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
   for (const t of ['reactions', 'messages', 'contacts', 'chats']) await pool.query(`DELETE FROM ${t}`);
+  await pool.query("UPDATE handlings SET status='released', active_chat=NULL, closed_at=? WHERE status='active'", [Date.now()]);
+  assignMap.clear();
   res.json({ success: true, message: 'WhatsApp disconnected and local data cleared. Scan a new QR code to reconnect.' });
   startSock();
 }));
 
 /* ───────────────────────── reading ───────────────────────── */
 
+// Admin gets every chat. Everyone else gets the unread ones (common inbox) plus the chats they handle.
 app.get('/chats', wrap(async (req, res) => {
-  res.json({ success: true, chats: (await getChats()).filter((c) => canAccess(req.user, c.id)) });
+  const all = await getChats();
+  const chats = req.user.role === 'admin' ? all : all.filter((c) => c.unreadCount > 0 || c.assignedTo?.id === req.user.id);
+  res.json({ success: true, chats });
 }));
 
 // ?limit=50&before=<unix timestamp> for scrolling up
 app.get('/messages/:chatId', wrap(async (req, res) => {
-  guard(req, req.params.chatId);
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const before = parseInt(req.query.before) || 9999999999999;
   const [rows] = await pool.query(
@@ -909,7 +1084,6 @@ app.get('/messages/:chatId', wrap(async (req, res) => {
 
 // Media: served from disk (downloaded on demand if missing). ?download=1 forces download
 app.get('/media/:chatId/:id', wrap(async (req, res) => {
-  guard(req, req.params.chatId);
   const raw = await getRaw(req.params.chatId, req.params.id);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
   const msg = simplify(raw);
@@ -931,7 +1105,6 @@ app.get('/media/:chatId/:id', wrap(async (req, res) => {
 const picCache = {};
 app.get('/profile-picture/:jid', requireReady, wrap(async (req, res) => {
   const jid = req.params.jid;
-  guard(req, jid);
   if (!(jid in picCache)) picCache[jid] = await sock.profilePictureUrl(jid, 'image').catch(() => null);
   res.json({ success: true, url: picCache[jid] });
 }));
@@ -944,7 +1117,7 @@ app.get('/contacts', requireAdmin, wrap(async (req, res) => {
   });
 }));
 
-/* ───────────────────────── sending ───────────────────────── */
+/* ───────────────────────── sending (only the coworker handling the chat, or admin) ───────────────────────── */
 
 app.post('/send/text', requireReady, wrap(async (req, res) => {
   const { chatId, phoneNumber, text, quotedId } = req.body;
@@ -986,7 +1159,7 @@ app.post('/send/location', requireReady, wrap(async (req, res) => {
 
 app.post('/react', requireReady, wrap(async (req, res) => {
   const { chatId, messageId, emoji } = req.body;
-  guard(req, chatId);
+  guardSend(req, chatId);
   const raw = await getRaw(chatId, messageId);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
   await sock.sendMessage(chatId, { react: { text: emoji || '', key: raw.key } });
@@ -1002,7 +1175,6 @@ app.post('/react', requireReady, wrap(async (req, res) => {
 
 app.post('/forward', requireReady, wrap(async (req, res) => {
   const { fromChatId, messageId, toChatId } = req.body;
-  guard(req, fromChatId);
   const raw = await getRaw(fromChatId, messageId);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
   const jid = await resolveTarget(toChatId, req.user);
@@ -1015,7 +1187,7 @@ app.post('/forward', requireReady, wrap(async (req, res) => {
 
 app.post('/delete', requireReady, wrap(async (req, res) => {
   const { chatId, messageId, forEveryone } = req.body;
-  guard(req, chatId);
+  guardSend(req, chatId);
   const raw = await getRaw(chatId, messageId);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
   if (forEveryone) {
@@ -1031,26 +1203,23 @@ app.post('/delete', requireReady, wrap(async (req, res) => {
 
 /* ───────────────────────── read receipts & presence ───────────────────────── */
 
+// Only the person handling the chat marks it read (previewing from the inbox does NOT)
 app.post('/read', requireReady, wrap(async (req, res) => {
   const { chatId } = req.body;
-  guard(req, chatId);
-  const [rows] = await pool.query('SELECT raw FROM messages WHERE chat_id=? AND from_me=0 ORDER BY ts DESC LIMIT 100', [chatId]);
-  const keys = rows.map((r) => JSON.parse(r.raw, BufferJSON.reviver).key);
-  if (keys.length) await sock.readMessages(keys);
-  await upsertChat(chatId, { unreadCount: 0 });
+  guardSend(req, chatId);
+  await markRead(chatId);
   emitChat(chatId);
   res.json({ success: true });
 }));
 
 // state: "composing" | "recording" | "paused" | "available" | "unavailable"
 app.post('/presence', requireReady, wrap(async (req, res) => {
-  guard(req, req.body.chatId);
+  guardSend(req, req.body.chatId);
   await sock.sendPresenceUpdate(req.body.state || 'composing', req.body.chatId);
   res.json({ success: true });
 }));
 
 app.post('/presence/subscribe', requireReady, wrap(async (req, res) => {
-  guard(req, req.body.chatId);
   await sock.presenceSubscribe(req.body.chatId);
   res.json({ success: true });
 }));
