@@ -25,15 +25,40 @@ const pino = require('pino');
 
 /* ───────────────────────── setup ───────────────────────── */
 
+
 const app = express();
-const ORIGIN = process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map((x) => x.trim()) : '*';
+
+// Hardcoded frontend domain — no CORS_ORIGIN environment variable needed.
+const ALLOWED_ORIGINS = [
+  'https://gripstylepos.netlify.app'
+];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests without an Origin header (server-to-server).
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error('Origin not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key']
+};
+
 app.set('trust proxy', 1);
-app.use(cors({ origin: ORIGIN }));
+app.use(cors(corsOptions));
 app.use(express.json());
-app.use(express.static('public')); // put your UI (index.html etc.) in ./public
+app.use(express.static('public'));
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: ORIGIN } });
+
+const io = new Server(server, {
+  cors: corsOptions
+});
+
+
+
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 64 * 1024 * 1024 } });
 const logger = pino({ level: 'silent' });
