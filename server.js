@@ -588,6 +588,13 @@ async function startSock() {
         console.log('New QR generated — waiting for scan via UI');
       }
       if (connection === 'open') {
+        const linked = numberFromJid(sock.user?.id || '');
+        const allowed = normPhone(process.env.WHATSAPP_NUMBER);
+        if (allowed && linked && linked !== allowed) {
+          console.log(`❌ Linked number +${linked} does not match WHATSAPP_NUMBER (+${allowed}). Unlinking.`);
+          try { await sock.logout(); } catch (_) { /* ignore */ }
+          return;
+        }
         isReady = true;
         latestQr = null;
         io.emit('ready', true);
@@ -601,6 +608,10 @@ async function startSock() {
         console.log('Connection closed. Status code:', statusCode, 'Reconnecting:', shouldReconnect);
         isStarting = false;
         if (shouldReconnect) startSock();
+        else {
+          await fs.promises.rm(AUTH_FOLDER, { recursive: true, force: true });
+          startSock();
+        }
       }
     });
 
@@ -726,6 +737,9 @@ io.on('connection', (socket) => {
 /* ───────────────────────── connection routes ───────────────────────── */
 
 app.get('/health', (req, res) => res.json({ status: 'ok', ready: isReady }));
+
+// Public, no login: shows the QR while WhatsApp is not linked, so anyone can link it
+app.get('/link/status', (req, res) => res.json({ ready: isReady, qr: isReady ? null : latestQr }));
 // ── login with a code sent over WhatsApp ──
 app.post('/auth/request-otp', wrap(async (req, res) => {
   const phone = normPhone(req.body.phone);
@@ -765,17 +779,7 @@ app.post('/auth/verify-otp', wrap(async (req, res) => {
 }));
 
 // Everything below needs a logged-in user (your old /send-* routes need the x-api-key header instead)
-// TEMPORARY AUTH BYPASS — DEVELOPMENT ONLY
-app.use((req, res, next) => {
-    req.user = {
-        id: 0,
-        name: 'Admin',
-        role: 'admin',
-        phone: process.env.ADMIN_PHONE
-    };
-
-    next();
-});
+app.use(requireAuth);
 
 app.get('/auth/me', (req, res) => res.json({ success: true, user: req.user, ready: isReady }));
 app.post('/auth/logout', wrap(async (req, res) => {
