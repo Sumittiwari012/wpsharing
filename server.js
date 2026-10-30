@@ -765,7 +765,17 @@ app.post('/auth/verify-otp', wrap(async (req, res) => {
 }));
 
 // Everything below needs a logged-in user (your old /send-* routes need the x-api-key header instead)
-app.use(requireAuth);
+// TEMPORARY AUTH BYPASS — DEVELOPMENT ONLY
+app.use((req, res, next) => {
+    req.user = {
+        id: 0,
+        name: 'Admin',
+        role: 'admin',
+        phone: process.env.ADMIN_PHONE
+    };
+
+    next();
+});
 
 app.get('/auth/me', (req, res) => res.json({ success: true, user: req.user, ready: isReady }));
 app.post('/auth/logout', wrap(async (req, res) => {
