@@ -950,7 +950,7 @@ const dropAccess = async (id) => {
   io.in('user:' + id).disconnectSockets(true);
 };
 
-app.get('/manage/users', requireAdmin, wrap(async (req, res) => {
+app.get('/admin/users', requireAdmin, wrap(async (req, res) => {
   const [rows] = await pool.query(
     `SELECT u.id, u.name, u.email, u.phone, u.role, u.active,
             (SELECT COUNT(*) FROM handlings h WHERE h.user_id = u.id AND h.status = 'active') AS chats
@@ -959,7 +959,7 @@ app.get('/manage/users', requireAdmin, wrap(async (req, res) => {
   res.json({ success: true, users: rows });
 }));
 
-app.post('/manage/users', requireAdmin, wrap(async (req, res) => {
+app.post('/admin/users', requireAdmin, wrap(async (req, res) => {
   const name = String(req.body.name || '').trim();
   const phone = normPhone(req.body.phone);
   if (!name || phone.length < 10) return res.status(400).json({ success: false, message: 'A name and a WhatsApp number (with country code) are required' });
@@ -973,7 +973,7 @@ app.post('/manage/users', requireAdmin, wrap(async (req, res) => {
   res.json({ success: true });
 }));
 
-app.patch('/manage/users/:id', requireAdmin, wrap(async (req, res) => {
+app.patch('/admin/users/:id', requireAdmin, wrap(async (req, res) => {
   const id = Number(req.params.id);
   const u = usersCache.get(id);
   if (!u || u.role === 'admin') return res.status(404).json({ success: false, message: 'Coworker not found' });
@@ -992,7 +992,7 @@ app.patch('/manage/users/:id', requireAdmin, wrap(async (req, res) => {
   res.json({ success: true });
 }));
 
-app.delete('/manage/users/:id', requireAdmin, wrap(async (req, res) => {
+app.delete('/admin/users/:id', requireAdmin, wrap(async (req, res) => {
   const id = Number(req.params.id);
   const u = usersCache.get(id);
   if (!u || u.role === 'admin') return res.status(404).json({ success: false, message: 'Coworker not found' });
@@ -1005,7 +1005,7 @@ app.delete('/manage/users/:id', requireAdmin, wrap(async (req, res) => {
 
 // Dashboard: per coworker how many chats they follow right now and how many ended as order cleared / cancelled.
 // ?days=N limits the closed counts to the last N days (0 = all time).
-app.get('/manage/stats', requireAdmin, wrap(async (req, res) => {
+app.get('/admin/stats', requireAdmin, wrap(async (req, res) => {
   const days = Math.max(0, Number(req.query.days) || 0);
   const since = days ? Date.now() - days * 864e5 : 0;
   const [rows] = await pool.query(
