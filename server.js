@@ -8,6 +8,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { Server } = require('socket.io');
 const mysql = require('mysql2/promise');
+const crypto = require('crypto');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -25,12 +26,14 @@ const pino = require('pino');
 /* ───────────────────────── setup ───────────────────────── */
 
 const app = express();
-app.use(cors());
+const ORIGIN = process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map((x) => x.trim()) : '*';
+app.set('trust proxy', 1);
+app.use(cors({ origin: ORIGIN }));
 app.use(express.json());
 app.use(express.static('public')); // put your UI (index.html etc.) in ./public
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
+const io = new Server(server, { cors: { origin: ORIGIN } });
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 64 * 1024 * 1024 } });
 const logger = pino({ level: 'silent' });
@@ -94,6 +97,54 @@ async function initDb() {
     emoji VARCHAR(16) NOT NULL,
     PRIMARY KEY (message_id, reactor)
   ) ${T}`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(190) NOT NULL UNIQUE,
+    phone VARCHAR(20) NULL,
+    role VARCHAR(10) NOT NULL DEFAULT 'agent',
+    active TINYINT NOT NULL DEFAULT 1
+  ) ${T}`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS otps (
+    email VARCHAR(190) PRIMARY KEY,
+    code_hash CHAR(64) NOT NULL,
+    expires_at BIGINT NOT NULL,
+    attempts INT NOT NULL DEFAULT 0,
+    last_sent BIGINT NOT NULL
+  ) ${T}`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS sessions (
+    token_hash CHAR(64) PRIMARY KEY,
+    user_id INT NOT NULL,
+    expires_at BIGINT NOT NULL,
+    created_at BIGINT NOT NULL,
+    KEY idx_user (user_id)
+  ) ${T}`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS assignments (
+    chat_id VARCHAR(80) PRIMARY KEY,
+    user_id INT NOT NULL,
+    assigned_at BIGINT NOT NULL,
+    KEY idx_user (user_id)
+  ) ${T}`);
+  try { await pool.query('ALTER TABLE messages ADD COLUMN sent_by INT NULL'); } catch (_) { /* column already exists */ }
+
+  // Login is by WhatsApp number (email is no longer needed)
+  try { await pool.query('ALTER TABLE users MODIFY email VARCHAR(190) NULL'); } catch (_) { /* already nullable */ }
+  try { await pool.query('ALTER TABLE users ADD UNIQUE KEY uniq_phone (phone)'); } catch (_) { /* already exists */ }
+  await pool.query(`CREATE TABLE IF NOT EXISTS login_codes (
+    phone VARCHAR(20) PRIMARY KEY,
+    code_hash CHAR(64) NOT NULL,
+    expires_at BIGINT NOT NULL,
+    attempts INT NOT NULL DEFAULT 0,
+    last_sent BIGINT NOT NULL
+  ) ${T}`);
+  const adminPhone = normPhone(process.env.ADMIN_PHONE);
+  if (adminPhone.length < 10) throw new Error('ADMIN_PHONE is missing in .env (with country code, e.g. 919876543210)');
+  await pool.query("UPDATE users SET role='agent', active=0 WHERE role='admin' AND (phone IS NULL OR phone <> ?)", [adminPhone]);
+  await pool.query(
+    "INSERT INTO users (name, phone, role, active) VALUES (?,?,'admin',1) ON DUPLICATE KEY UPDATE role='admin', active=1, name=VALUES(name)",
+    [process.env.ADMIN_NAME || 'Admin', adminPhone]
+  );
+  await loadCaches();
   console.log('MySQL ready');
 }
 
@@ -146,7 +197,7 @@ async function getReactions(ids) {
 }
 
 function rowToMsg(r, reactions = {}) {
-  const m = { ...JSON.parse(r.data), status: r.status || null, deleted: !!r.deleted, reactions };
+  const m = { ...JSON.parse(r.data), status: r.status || null, deleted: !!r.deleted, reactions, sentBy: r.sent_by ? usersCache.get(r.sent_by)?.name || null : null };
   if (r.deleted) {
     m.type = 'deleted';
     m.text = '🚫 This message was deleted';
@@ -187,6 +238,7 @@ function chatRowToJson(r) {
     lastMessageTime: r.last_message_time || 0,
     pinned: !!r.pinned,
     archived: !!r.archived,
+    assignedTo: assignedInfo(r.id),
     lastMessage: last
   };
 }
@@ -215,7 +267,7 @@ async function getChats(onlyJid) {
 
 async function emitChat(jid) {
   const [c] = await getChats(jid);
-  if (c) io.emit('chat-update', c);
+  if (c) emitToChat(jid, 'chat-update', c);
 }
 
 /* ───────────────── WhatsApp message → clean JSON ───────────────── */
@@ -345,22 +397,33 @@ function toJid(phoneNumber) {
   return `${number}@s.whatsapp.net`;
 }
 
-async function resolveTarget(input) {
+async function resolveTarget(input, user) {
   if (!input) throw Object.assign(new Error('chatId / phoneNumber is required'), { status: 400 });
-  if (String(input).includes('@')) return String(input);
+  const deny = () => Object.assign(new Error('Not allowed: this chat is not assigned to you'), { status: 403 });
+  if (String(input).includes('@')) {
+    if (user && !canAccess(user, String(input))) throw deny();
+    return String(input);
+  }
   const jid = toJid(input);
+  if (user && !canAccess(user, jid)) throw deny();
   const [check] = await sock.onWhatsApp(jid);
   if (!check?.exists) throw Object.assign(new Error('This number is not registered on WhatsApp'), { status: 400 });
-  return check.jid || jid;
+  const final = check.jid || jid;
+  if (user && !canAccess(user, final)) throw deny();
+  return final;
 }
 
 // media = { buffer } optional: saves the file we just sent straight to disk
-async function sendAndStore(jid, content, quotedId, media) {
+async function sendAndStore(jid, content, quotedId, media, userId) {
   const opts = quotedId ? { quoted: (await getRaw(jid, quotedId)) || undefined } : {};
   const sent = await sock.sendMessage(jid, content, opts);
-  const msg = await addMessage(sent);
+  let msg = await addMessage(sent);
   if (msg && media?.buffer && MEDIA_TYPES.includes(msg.type)) await writeMedia(msg, media.buffer);
-  if (msg) io.emit('message', msg);
+  if (msg && userId) {
+    await pool.query('UPDATE messages SET sent_by=? WHERE chat_id=? AND id=?', [userId, jid, msg.id]);
+    msg = await getMessage(jid, msg.id);
+  }
+  if (msg) emitToChat(jid, 'message', msg);
   emitChat(jid);
   return msg;
 }
@@ -397,6 +460,101 @@ const safe = (fn) => async (...args) => {
 const requireReady = (req, res, next) =>
   isReady ? next() : res.status(503).json({ success: false, message: 'WhatsApp not connected yet' });
 
+/* ───────────────────────── auth, roles & assignments ───────────────────────── */
+
+const digits = (v) => String(v || '').replace(/\D/g, '');
+const normPhone = (v) => { let n = digits(v); if (n.length === 10) n = '91' + n; return n; };
+const sha = (v) => crypto.createHash('sha256').update(String(v)).digest('hex');
+const safeEq = (a, b) => {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+
+const OTP_TTL = 5 * 60 * 1000;
+const SESSION_TTL = 7 * 24 * 3600 * 1000;
+const assignMap = new Map();   // chat jid -> coworker user id
+const usersCache = new Map();  // user id -> { id, name, email, phone, role, active }
+const otpMsgIds = new Set();   // OTP messages we sent over WhatsApp (not stored as chats)
+
+async function loadCaches() {
+  const [users] = await pool.query('SELECT id, name, email, phone, role, active FROM users');
+  usersCache.clear();
+  users.forEach((u) => usersCache.set(u.id, u));
+  const [rows] = await pool.query('SELECT chat_id, user_id FROM assignments');
+  assignMap.clear();
+  rows.forEach((a) => assignMap.set(a.chat_id, a.user_id));
+}
+
+const canAccess = (user, chatId) => user.role === 'admin' || assignMap.get(chatId) === user.id;
+const guard = (req, chatId) => {
+  if (!canAccess(req.user, chatId)) throw Object.assign(new Error('Not allowed: this chat is not assigned to you'), { status: 403 });
+};
+const assignedInfo = (chatId) => {
+  const u = usersCache.get(assignMap.get(chatId));
+  return u ? { id: u.id, name: u.name } : null;
+};
+
+// Events about a chat go only to admins and to the coworker it is assigned to
+function emitToChat(chatId, event, payload) {
+  let room = io.to('admin');
+  const uid = assignMap.get(chatId);
+  if (uid) room = room.to('user:' + uid);
+  room.emit(event, payload);
+}
+
+async function userFromToken(token) {
+  if (!token) return null;
+  const [rows] = await pool.query(
+    `SELECT u.id, u.name, u.email, u.phone, u.role FROM sessions s JOIN users u ON u.id = s.user_id
+      WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1`,
+    [sha(token), Date.now()]
+  );
+  return rows[0] || null;
+}
+
+const tokenOf = (req) => (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.query.token || '';
+const LEGACY = new Set(['/send-text', '/send-invoice', '/send-image']); // your billing system: uses x-api-key
+const keyOk = (req) => !!process.env.SERVICE_API_KEY && safeEq(req.headers['x-api-key'] || '', process.env.SERVICE_API_KEY);
+
+const requireAuth = async (req, res, next) => {
+  try {
+    if (LEGACY.has(req.path)) {
+      return keyOk(req) ? next() : res.status(401).json({ success: false, message: 'x-api-key header required' });
+    }
+    const user = await userFromToken(tokenOf(req));
+    if (!user) return res.status(401).json({ success: false, message: 'Please log in' });
+    req.user = user;
+    next();
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+};
+const requireAdmin = (req, res, next) =>
+  req.user?.role === 'admin' ? next() : res.status(403).json({ success: false, message: 'Admin only' });
+
+// OTP delivery: always through the linked WhatsApp.
+// Only before WhatsApp is linked (first admin login) the admin's code is printed in the server log.
+async function sendOtp(user, code) {
+  const text = `Your login code is ${code}. It expires in 5 minutes. Do not share it with anyone.`;
+  if (isReady && sock) {
+    const m = await sock.sendMessage(toJid(user.phone), { text });
+    if (m?.key?.id) otpMsgIds.add(m.key.id);
+    return 'whatsapp';
+  }
+  if (user.role === 'admin') console.log(`⚠️  WhatsApp is not linked yet. Admin login code for +${user.phone}: ${code}`);
+  return 'none';
+}
+
+const hits = new Map();
+const limited = (key, max, windowMs) => {
+  const now = Date.now();
+  const list = (hits.get(key) || []).filter((t) => now - t < windowMs);
+  list.push(now);
+  hits.set(key, list);
+  return list.length > max;
+};
+
 /* ───────────────────────── WhatsApp socket ───────────────────────── */
 
 async function startSock() {
@@ -426,7 +584,7 @@ async function startSock() {
       if (qr) {
         latestQr = await qrcode.toDataURL(qr);
         isReady = false;
-        io.emit('qr', latestQr);
+        io.to('admin').emit('qr', latestQr);
         console.log('New QR generated — waiting for scan via UI');
       }
       if (connection === 'open') {
@@ -459,7 +617,7 @@ async function startSock() {
         });
       }
       for (const m of messages) await addMessage(m);
-      io.emit('history-synced', { chats: chats.length, messages: messages.length });
+      io.to('admin').emit('history-synced', { chats: chats.length, messages: messages.length });
     }));
 
     sock.ev.on('contacts.upsert', safe(async (list) => { for (const c of list) await upsertContact(c.id, { name: c.name, notify: c.notify }); }));
@@ -495,16 +653,17 @@ async function startSock() {
       for (const id of ids) {
         await pool.query('DELETE FROM messages WHERE chat_id=?', [id]);
         await pool.query('DELETE FROM chats WHERE id=?', [id]);
-        io.emit('chat-deleted', id);
+        emitToChat(id, 'chat-deleted', id);
       }
     }));
 
     // New incoming / outgoing messages
     sock.ev.on('messages.upsert', safe(async ({ messages, type }) => {
       for (const raw of messages) {
+        if (otpMsgIds.has(raw.key?.id)) continue;
         const msg = await addMessage(raw);
         if (!msg) continue;
-        io.emit('message', msg);
+        emitToChat(msg.chatId, 'message', msg);
         emitChat(msg.chatId);
         // Save incoming media right away, because WhatsApp media links expire
         if (type === 'notify' && !msg.fromMe && MEDIA_TYPES.includes(msg.type)) {
@@ -523,7 +682,7 @@ async function startSock() {
           await pool.query('UPDATE messages SET deleted=1 WHERE chat_id=? AND id=?', [key.remoteJid, key.id]);
         }
         const msg = await getMessage(key.remoteJid, key.id);
-        if (msg) io.emit('message-update', msg);
+        if (msg) emitToChat(msg.chatId, 'message-update', msg);
       }
     }));
 
@@ -536,11 +695,11 @@ async function startSock() {
           await pool.query('DELETE FROM reactions WHERE message_id=? AND reactor=?', [key.id, reactor]);
         }
         const r = await getReactions([key.id]);
-        io.emit('message-update', { id: key.id, chatId: key.remoteJid, reactions: r[key.id] || {} });
+        emitToChat(key.remoteJid, 'message-update', { id: key.id, chatId: key.remoteJid, reactions: r[key.id] || {} });
       }
     }));
 
-    sock.ev.on('presence.update', ({ id, presences }) => io.emit('presence', { chatId: id, presences }));
+    sock.ev.on('presence.update', ({ id, presences }) => emitToChat(id, 'presence', { chatId: id, presences }));
   } catch (err) {
     console.error('startSock() failed:', err);
     isStarting = false;
@@ -549,16 +708,159 @@ async function startSock() {
   }
 }
 
+io.use(async (socket, next) => {
+  try {
+    const user = await userFromToken(socket.handshake.auth?.token);
+    if (!user) return next(new Error('unauthorized'));
+    socket.user = user;
+    next();
+  } catch (e) { next(e); }
+});
+
 io.on('connection', (socket) => {
-  socket.emit('status', { ready: isReady, qr: isReady ? null : latestQr });
+  socket.join('user:' + socket.user.id);
+  if (socket.user.role === 'admin') socket.join('admin');
+  socket.emit('status', { ready: isReady, qr: isReady || socket.user.role !== 'admin' ? null : latestQr });
 });
 
 /* ───────────────────────── connection routes ───────────────────────── */
 
 app.get('/health', (req, res) => res.json({ status: 'ok', ready: isReady }));
-app.get('/qr-status', (req, res) => res.json({ ready: isReady, qr: isReady ? null : latestQr }));
+// ── login with a code sent over WhatsApp ──
+app.post('/auth/request-otp', wrap(async (req, res) => {
+  const phone = normPhone(req.body.phone);
+  if (phone.length < 10) return res.status(400).json({ success: false, message: 'Enter your WhatsApp number with country code' });
+  if (limited('otp:' + req.ip, 10, 10 * 60 * 1000)) return res.status(429).json({ success: false, message: 'Too many attempts. Try again later.' });
+  const [rows] = await pool.query('SELECT id, name, phone, role FROM users WHERE phone=? AND active=1', [phone]);
+  if (rows[0]) {
+    const [o] = await pool.query('SELECT last_sent FROM login_codes WHERE phone=?', [phone]);
+    if (!o[0] || Date.now() - o[0].last_sent > 30000) {
+      const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+      await pool.query('REPLACE INTO login_codes (phone, code_hash, expires_at, attempts, last_sent) VALUES (?,?,?,0,?)', [phone, sha(code + phone), Date.now() + OTP_TTL, Date.now()]);
+      sendOtp(rows[0], code).catch((e) => console.error('OTP send failed:', e.message));
+    }
+  }
+  // Same answer whether or not the number is registered
+  res.json({ success: true, message: 'If this number is registered, a login code has been sent on WhatsApp.' });
+}));
 
-app.post('/logout', wrap(async (req, res) => {
+app.post('/auth/verify-otp', wrap(async (req, res) => {
+  const phone = normPhone(req.body.phone);
+  const code = String(req.body.code || '').trim();
+  if (limited('ver:' + req.ip, 20, 10 * 60 * 1000)) return res.status(429).json({ success: false, message: 'Too many attempts. Try again later.' });
+  const bad = () => res.status(401).json({ success: false, message: 'Invalid or expired code' });
+  const [o] = await pool.query('SELECT * FROM login_codes WHERE phone=?', [phone]);
+  if (!o[0] || o[0].expires_at < Date.now() || o[0].attempts >= 5) return bad();
+  if (!safeEq(sha(code + phone), o[0].code_hash)) {
+    await pool.query('UPDATE login_codes SET attempts = attempts + 1 WHERE phone=?', [phone]);
+    return bad();
+  }
+  await pool.query('DELETE FROM login_codes WHERE phone=?', [phone]);
+  const [u] = await pool.query('SELECT id, name, phone, role FROM users WHERE phone=? AND active=1', [phone]);
+  if (!u[0]) return bad();
+  const token = crypto.randomBytes(32).toString('hex');
+  await pool.query('DELETE FROM sessions WHERE expires_at < ?', [Date.now()]);
+  await pool.query('INSERT INTO sessions (token_hash, user_id, expires_at, created_at) VALUES (?,?,?,?)', [sha(token), u[0].id, Date.now() + SESSION_TTL, Date.now()]);
+  res.json({ success: true, token, user: u[0] });
+}));
+
+// Everything below needs a logged-in user (your old /send-* routes need the x-api-key header instead)
+app.use(requireAuth);
+
+app.get('/auth/me', (req, res) => res.json({ success: true, user: req.user, ready: isReady }));
+app.post('/auth/logout', wrap(async (req, res) => {
+  await pool.query('DELETE FROM sessions WHERE token_hash=?', [sha(tokenOf(req))]);
+  res.json({ success: true });
+}));
+
+app.get('/qr-status', requireAdmin, (req, res) => res.json({ ready: isReady, qr: isReady ? null : latestQr }));
+
+// ── admin: coworkers & assignments ──
+const dropAccess = async (id) => {
+  await pool.query('DELETE FROM sessions WHERE user_id=?', [id]);
+  io.in('user:' + id).disconnectSockets(true);
+};
+
+app.get('/admin/users', requireAdmin, wrap(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT u.id, u.name, u.email, u.phone, u.role, u.active,
+            (SELECT COUNT(*) FROM assignments a WHERE a.user_id = u.id) AS chats
+       FROM users u ORDER BY u.role, u.name`
+  );
+  res.json({ success: true, users: rows });
+}));
+
+app.post('/admin/users', requireAdmin, wrap(async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const phone = normPhone(req.body.phone);
+  if (!name || phone.length < 10) return res.status(400).json({ success: false, message: 'A name and a WhatsApp number (with country code) are required' });
+  try {
+    await pool.query("INSERT INTO users (name, phone, role, active) VALUES (?,?,'agent',1)", [name, phone]);
+  } catch (e) {
+    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ success: false, message: 'That number already exists' });
+    throw e;
+  }
+  await loadCaches();
+  res.json({ success: true });
+}));
+
+app.patch('/admin/users/:id', requireAdmin, wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const u = usersCache.get(id);
+  if (!u || u.role === 'admin') return res.status(404).json({ success: false, message: 'Coworker not found' });
+  const sets = [];
+  const vals = [];
+  const b = req.body;
+  if (b.name) { sets.push('name=?'); vals.push(String(b.name).trim()); }
+  if (b.phone !== undefined) { sets.push('phone=?'); vals.push(normPhone(b.phone) || null); }
+  if (b.active !== undefined) { sets.push('active=?'); vals.push(b.active ? 1 : 0); }
+  if (sets.length) await pool.query(`UPDATE users SET ${sets.join(',')} WHERE id=?`, [...vals, id]);
+  if (b.active !== undefined && !b.active) await dropAccess(id);
+  await loadCaches();
+  res.json({ success: true });
+}));
+
+app.delete('/admin/users/:id', requireAdmin, wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const u = usersCache.get(id);
+  if (!u || u.role === 'admin') return res.status(404).json({ success: false, message: 'Coworker not found' });
+  await dropAccess(id);
+  await pool.query('DELETE FROM assignments WHERE user_id=?', [id]);
+  await pool.query('DELETE FROM users WHERE id=?', [id]);
+  await loadCaches();
+  res.json({ success: true });
+}));
+
+// Body: { chatId | phoneNumber, userId }  (userId null = unassign)
+app.post('/admin/assign', requireAdmin, wrap(async (req, res) => {
+  const { chatId, phoneNumber } = req.body;
+  const userId = req.body.userId == null || req.body.userId === '' ? null : Number(req.body.userId);
+  const jid = chatId || (phoneNumber ? toJid(phoneNumber) : null);
+  if (!jid) return res.status(400).json({ success: false, message: 'chatId or phoneNumber is required' });
+  if (userId != null) {
+    const u = usersCache.get(userId);
+    if (!u || u.role === 'admin' || !u.active) return res.status(400).json({ success: false, message: 'Choose an active coworker' });
+  }
+  const old = assignMap.get(jid);
+  if (userId == null) await pool.query('DELETE FROM assignments WHERE chat_id=?', [jid]);
+  else await pool.query('REPLACE INTO assignments (chat_id, user_id, assigned_at) VALUES (?,?,?)', [jid, userId, Date.now()]);
+  await loadCaches();
+  if (old && old !== userId) io.to('user:' + old).emit('chat-deleted', jid);
+  await emitChat(jid);
+  res.json({ success: true, chatId: jid });
+}));
+
+app.get('/admin/assignments', requireAdmin, wrap(async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT a.chat_id, a.user_id, COALESCE(ct.name, c.name, ct.notify) AS name
+       FROM assignments a LEFT JOIN chats c ON c.id = a.chat_id LEFT JOIN contacts ct ON ct.id = a.chat_id
+      ORDER BY a.assigned_at DESC`
+  );
+  res.json({ success: true, assignments: rows.map((r) => ({ chatId: r.chat_id, userId: r.user_id, name: r.name || '+' + numberFromJid(r.chat_id) })) });
+}));
+
+
+app.post('/whatsapp/logout', requireAdmin, wrap(async (req, res) => {
   try { await sock.logout(); } catch (e) { console.warn('sock.logout() error (continuing):', e.message); }
   isReady = false;
   await fs.promises.rm(AUTH_FOLDER, { recursive: true, force: true });
@@ -572,11 +874,12 @@ app.post('/logout', wrap(async (req, res) => {
 /* ───────────────────────── reading ───────────────────────── */
 
 app.get('/chats', wrap(async (req, res) => {
-  res.json({ success: true, chats: await getChats() });
+  res.json({ success: true, chats: (await getChats()).filter((c) => canAccess(req.user, c.id)) });
 }));
 
 // ?limit=50&before=<unix timestamp> for scrolling up
 app.get('/messages/:chatId', wrap(async (req, res) => {
+  guard(req, req.params.chatId);
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const before = parseInt(req.query.before) || 9999999999999;
   const [rows] = await pool.query(
@@ -591,6 +894,7 @@ app.get('/messages/:chatId', wrap(async (req, res) => {
 
 // Media: served from disk (downloaded on demand if missing). ?download=1 forces download
 app.get('/media/:chatId/:id', wrap(async (req, res) => {
+  guard(req, req.params.chatId);
   const raw = await getRaw(req.params.chatId, req.params.id);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
   const msg = simplify(raw);
@@ -604,7 +908,7 @@ app.get('/media/:chatId/:id', wrap(async (req, res) => {
     file = await ensureMediaFile(raw, msg);
   }
   res.set('Content-Type', msg.mimetype || 'application/octet-stream');
-  res.set('Cache-Control', 'public, max-age=31536000, immutable'); // lets the CDN cache it
+  res.set('Cache-Control', 'private, max-age=86400');
   if (req.query.download) res.attachment(msg.fileName || path.basename(file));
   res.sendFile(file); // supports Range requests so audio/video can seek
 }));
@@ -612,11 +916,12 @@ app.get('/media/:chatId/:id', wrap(async (req, res) => {
 const picCache = {};
 app.get('/profile-picture/:jid', requireReady, wrap(async (req, res) => {
   const jid = req.params.jid;
+  guard(req, jid);
   if (!(jid in picCache)) picCache[jid] = await sock.profilePictureUrl(jid, 'image').catch(() => null);
   res.json({ success: true, url: picCache[jid] });
 }));
 
-app.get('/contacts', wrap(async (req, res) => {
+app.get('/contacts', requireAdmin, wrap(async (req, res) => {
   const [rows] = await pool.query("SELECT id, name, notify FROM contacts WHERE id LIKE '%@s.whatsapp.net'");
   res.json({
     success: true,
@@ -629,8 +934,8 @@ app.get('/contacts', wrap(async (req, res) => {
 app.post('/send/text', requireReady, wrap(async (req, res) => {
   const { chatId, phoneNumber, text, quotedId } = req.body;
   if (!text) return res.status(400).json({ success: false, message: 'text is required' });
-  const jid = await resolveTarget(chatId || phoneNumber);
-  res.json({ success: true, message: await sendAndStore(jid, { text }, quotedId) });
+  const jid = await resolveTarget(chatId || phoneNumber, req.user);
+  res.json({ success: true, message: await sendAndStore(jid, { text }, quotedId, null, req.user.id) });
 }));
 
 // multipart/form-data: file, chatId|phoneNumber, caption?, quotedId?, ptt? ("true" = voice note), gif?
@@ -638,7 +943,7 @@ app.post('/send/media', requireReady, upload.single('file'), wrap(async (req, re
   const { chatId, phoneNumber, caption, quotedId, ptt, gif } = req.body;
   const file = req.file;
   if (!file) return res.status(400).json({ success: false, message: 'file is required' });
-  const jid = await resolveTarget(chatId || phoneNumber);
+  const jid = await resolveTarget(chatId || phoneNumber, req.user);
 
   let content;
   let saved = file.buffer;
@@ -655,17 +960,18 @@ app.post('/send/media', requireReady, upload.single('file'), wrap(async (req, re
   } else {
     content = { document: file.buffer, mimetype: mime || 'application/octet-stream', fileName: file.originalname, caption: caption || undefined };
   }
-  res.json({ success: true, message: await sendAndStore(jid, content, quotedId, { buffer: saved }) });
+  res.json({ success: true, message: await sendAndStore(jid, content, quotedId, { buffer: saved }, req.user.id) });
 }));
 
 app.post('/send/location', requireReady, wrap(async (req, res) => {
   const { chatId, phoneNumber, lat, lng, name } = req.body;
-  const jid = await resolveTarget(chatId || phoneNumber);
-  res.json({ success: true, message: await sendAndStore(jid, { location: { degreesLatitude: lat, degreesLongitude: lng, name } }) });
+  const jid = await resolveTarget(chatId || phoneNumber, req.user);
+  res.json({ success: true, message: await sendAndStore(jid, { location: { degreesLatitude: lat, degreesLongitude: lng, name } }, null, null, req.user.id) });
 }));
 
 app.post('/react', requireReady, wrap(async (req, res) => {
   const { chatId, messageId, emoji } = req.body;
+  guard(req, chatId);
   const raw = await getRaw(chatId, messageId);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
   await sock.sendMessage(chatId, { react: { text: emoji || '', key: raw.key } });
@@ -675,24 +981,26 @@ app.post('/react', requireReady, wrap(async (req, res) => {
     await pool.query('DELETE FROM reactions WHERE message_id=? AND reactor=?', [messageId, 'me']);
   }
   const r = await getReactions([messageId]);
-  io.emit('message-update', { id: messageId, chatId, reactions: r[messageId] || {} });
+  emitToChat(chatId, 'message-update', { id: messageId, chatId, reactions: r[messageId] || {} });
   res.json({ success: true });
 }));
 
 app.post('/forward', requireReady, wrap(async (req, res) => {
   const { fromChatId, messageId, toChatId } = req.body;
+  guard(req, fromChatId);
   const raw = await getRaw(fromChatId, messageId);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
-  const jid = await resolveTarget(toChatId);
+  const jid = await resolveTarget(toChatId, req.user);
   const sent = await sock.sendMessage(jid, { forward: raw });
   const msg = await addMessage(sent);
-  if (msg) io.emit('message', msg);
+  if (msg) emitToChat(jid, 'message', msg);
   emitChat(jid);
   res.json({ success: true, message: msg });
 }));
 
 app.post('/delete', requireReady, wrap(async (req, res) => {
   const { chatId, messageId, forEveryone } = req.body;
+  guard(req, chatId);
   const raw = await getRaw(chatId, messageId);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
   if (forEveryone) {
@@ -700,7 +1008,7 @@ app.post('/delete', requireReady, wrap(async (req, res) => {
   } else {
     await pool.query('DELETE FROM messages WHERE chat_id=? AND id=?', [chatId, messageId]);
     await pool.query('DELETE FROM reactions WHERE message_id=?', [messageId]);
-    io.emit('message-removed', { chatId, id: messageId });
+    emitToChat(chatId, 'message-removed', { chatId, id: messageId });
     emitChat(chatId);
   }
   res.json({ success: true });
@@ -710,6 +1018,7 @@ app.post('/delete', requireReady, wrap(async (req, res) => {
 
 app.post('/read', requireReady, wrap(async (req, res) => {
   const { chatId } = req.body;
+  guard(req, chatId);
   const [rows] = await pool.query('SELECT raw FROM messages WHERE chat_id=? AND from_me=0 ORDER BY ts DESC LIMIT 100', [chatId]);
   const keys = rows.map((r) => JSON.parse(r.raw, BufferJSON.reviver).key);
   if (keys.length) await sock.readMessages(keys);
@@ -720,11 +1029,13 @@ app.post('/read', requireReady, wrap(async (req, res) => {
 
 // state: "composing" | "recording" | "paused" | "available" | "unavailable"
 app.post('/presence', requireReady, wrap(async (req, res) => {
+  guard(req, req.body.chatId);
   await sock.sendPresenceUpdate(req.body.state || 'composing', req.body.chatId);
   res.json({ success: true });
 }));
 
 app.post('/presence/subscribe', requireReady, wrap(async (req, res) => {
+  guard(req, req.body.chatId);
   await sock.presenceSubscribe(req.body.chatId);
   res.json({ success: true });
 }));
@@ -766,7 +1077,7 @@ app.post('/send-image', requireReady, wrap(async (req, res) => {
   try {
     await initDb();
   } catch (e) {
-    console.error('❌ MySQL connection failed — check DB_* values in .env:', e.message);
+    console.error('❌ Startup failed — check DB_* values and ADMIN_PHONE in .env:', e.message);
     process.exit(1);
   }
   startSock();
