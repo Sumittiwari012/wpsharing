@@ -422,7 +422,7 @@ async function ensureMediaFile(raw, m) {
 /* ───────────────────────── helpers ───────────────────────── */
 
 function toJid(phoneNumber) {
-  let number = String(phoneNumber).replace(/\D/g, '');
+  let number = String(phoneNumber).replace(/\D/g, '').replace(/^0+/, '');
   if (number.length === 10) number = '91' + number; // default India code if missing
   return `${number}@s.whatsapp.net`;
 }
@@ -504,7 +504,7 @@ const requireReady = (req, res, next) =>
 /* ───────────────────────── auth, roles & chat ownership ───────────────────────── */
 
 const digits = (v) => String(v || '').replace(/\D/g, '');
-const normPhone = (v) => { let n = digits(v); if (n.length === 10) n = '91' + n; return n; };
+const normPhone = (v) => { let n = digits(v).replace(/^0+/, ''); if (n.length === 10) n = '91' + n; return n; }; // 10 digits -> 91 is added
 const sha = (v) => crypto.createHash('sha256').update(String(v)).digest('hex');
 const safeEq = (a, b) => {
   const x = Buffer.from(String(a));
