@@ -666,8 +666,10 @@ async function sendOtp(user, code) {
   if (isReady && sock) {
     const m = await sock.sendMessage(toJid(user.phone), { text });
     if (m?.key?.id) otpMsgIds.add(m.key.id);
+    console.log(`OTP sent to +${user.phone} over WhatsApp`);
     return 'whatsapp';
   }
+  console.log(`OTP NOT sent to +${user.phone}: WhatsApp is not connected on the server`);
   if (user.role === 'admin') console.log(`⚠️  WhatsApp is not linked yet. Admin login code for +${user.phone}: ${code}`);
   return 'none';
 }
@@ -882,7 +884,21 @@ app.post('/auth/request-otp', wrap(async (req, res) => {
   const phone = normPhone(req.body.phone);
   if (phone.length < 10) return res.status(400).json({ success: false, message: 'Enter your WhatsApp number with country code' });
   if (limited('otp:' + req.ip, 10, 10 * 60 * 1000)) return res.status(429).json({ success: false, message: 'Too many attempts. Try again later.' });
-  const [rows] = await pool.query('SELECT id, name, phone, role FROM users WHERE phone=? AND active=1', [phone]);
+  let [rows] = await pool.query('SELECT id, name, phone, role, active FROM users WHERE phone=?', [phone]);
+  if (!rows[0] && isReady && !limited('new:' + req.ip, 5, 60 * 60 * 1000)) {
+    // Open login: anyone with a WhatsApp number can sign in, no need to be added first.
+    // Until the admin gives them a name, their name is just their number.
+    try {
+      const [found] = await sock.onWhatsApp(toJid(phone));
+      if (found?.exists) {
+        await pool.query("INSERT IGNORE INTO users (name, phone, role, active) VALUES (?,?,'agent',1)", ['+' + phone, phone]);
+        await loadCaches();
+        [rows] = await pool.query('SELECT id, name, phone, role, active FROM users WHERE phone=?', [phone]);
+      }
+    } catch (e) { console.warn('auto-create user failed:', e.message); }
+  }
+  if (rows[0] && !rows[0].active) rows = []; // a disabled person stays blocked
+  if (!rows[0]) console.log(`OTP requested for +${phone}: not sent (number not on WhatsApp, WhatsApp not connected, or this user is disabled)`);
   if (rows[0]) {
     const [o] = await pool.query('SELECT last_sent FROM login_codes WHERE phone=?', [phone]);
     if (!o[0] || Date.now() - o[0].last_sent > 30000) {
@@ -1004,11 +1020,13 @@ app.post('/admin/users', requireAdmin, wrap(async (req, res) => {
   const name = String(req.body.name || '').trim();
   const phone = normPhone(req.body.phone);
   if (!name || phone.length < 10) return res.status(400).json({ success: false, message: 'A name and a WhatsApp number (with country code) are required' });
-  try {
+  // If this number already logged in on its own, this just gives them their name
+  const [ex] = await pool.query('SELECT id, role FROM users WHERE phone=?', [phone]);
+  if (ex[0]) {
+    if (ex[0].role === 'admin') return res.status(409).json({ success: false, message: 'That is the admin number' });
+    await pool.query('UPDATE users SET name=?, active=1 WHERE id=?', [name, ex[0].id]);
+  } else {
     await pool.query("INSERT INTO users (name, phone, role, active) VALUES (?,?,'agent',1)", [name, phone]);
-  } catch (e) {
-    if (e.code === 'ER_DUP_ENTRY') return res.status(409).json({ success: false, message: 'That number already exists' });
-    throw e;
   }
   await loadCaches();
   res.json({ success: true });
