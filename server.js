@@ -513,7 +513,7 @@ const safeEq = (a, b) => {
 };
 
 const OTP_TTL = 5 * 60 * 1000;
-const SESSION_TTL = 7 * 24 * 3600 * 1000;
+const SESSION_TTL = 10 * 365 * 24 * 3600 * 1000; // ~10 years
 const assignMap = new Map();   // chat jid -> user id of the coworker handling it right now
 const prefMap = new Map();     // chat jid -> user id who takes care of this number (gets its future messages)
 const usersCache = new Map();  // user id -> { id, name, email, phone, role, active }
