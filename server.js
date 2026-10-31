@@ -873,6 +873,10 @@ io.on('connection', (socket) => {
 
 app.get('/health', (req, res) => res.json({ status: 'ok', ready: isReady }));
 
+// Public, no login: used by the separate "WhatsApp Connection Setup" page to show the QR while WhatsApp is not linked.
+// Safety: set WHATSAPP_NUMBER in .env. Any other number that scans this QR is unlinked again automatically.
+app.get('/link/status', (req, res) => res.json({ ready: isReady, qr: isReady ? null : latestQr }));
+
 // ── login with a code sent over WhatsApp ──
 app.post('/auth/request-otp', wrap(async (req, res) => {
   const phone = normPhone(req.body.phone);
