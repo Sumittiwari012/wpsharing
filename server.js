@@ -139,6 +139,15 @@ async function initDb() {
     KEY idx_chat (chat_id),
     KEY idx_user_status (user_id, status)
   ) ${T}`);
+  // "I will take care of this number": who gets future messages of a number, even after the chat was closed.
+  // Set when someone claims / is transferred a chat, removed when it is released back to the inbox.
+  await pool.query(`CREATE TABLE IF NOT EXISTS preferred_owners (
+    chat_id VARCHAR(80) PRIMARY KEY,
+    user_id INT NOT NULL,
+    set_at BIGINT NOT NULL,
+    KEY idx_user (user_id)
+  ) ${T}`);
+  await pool.query("INSERT IGNORE INTO preferred_owners (chat_id, user_id, set_at) SELECT chat_id, user_id, started_at FROM handlings WHERE status='active'");
   // One-time migration from the old admin-driven "assignments" table (ignored if it does not exist)
   try {
     await pool.query(`INSERT IGNORE INTO handlings (chat_id, user_id, status, active_chat, started_at)
@@ -506,6 +515,7 @@ const safeEq = (a, b) => {
 const OTP_TTL = 5 * 60 * 1000;
 const SESSION_TTL = 7 * 24 * 3600 * 1000;
 const assignMap = new Map();   // chat jid -> user id of the coworker handling it right now
+const prefMap = new Map();     // chat jid -> user id who takes care of this number (gets its future messages)
 const usersCache = new Map();  // user id -> { id, name, email, phone, role, active }
 const otpMsgIds = new Set();   // OTP messages we sent over WhatsApp (not stored as chats)
 
@@ -516,6 +526,22 @@ async function loadCaches() {
   const [rows] = await pool.query("SELECT chat_id, user_id FROM handlings WHERE status='active'");
   assignMap.clear();
   rows.forEach((a) => assignMap.set(a.chat_id, a.user_id));
+  const [prefs] = await pool.query('SELECT chat_id, user_id FROM preferred_owners');
+  prefMap.clear();
+  prefs.forEach((a) => prefMap.set(a.chat_id, a.user_id));
+}
+
+async function setPreferred(chatId, userId) {
+  await pool.query('REPLACE INTO preferred_owners (chat_id, user_id, set_at) VALUES (?,?,?)', [chatId, userId, Date.now()]);
+  prefMap.set(chatId, userId);
+}
+async function clearPreferred(chatId) {
+  await pool.query('DELETE FROM preferred_owners WHERE chat_id=?', [chatId]);
+  prefMap.delete(chatId);
+}
+async function clearPreferredOf(userId) {
+  await pool.query('DELETE FROM preferred_owners WHERE user_id=?', [userId]);
+  for (const [c, u] of prefMap) if (u === userId) prefMap.delete(c);
 }
 
 // Anyone logged in can READ any chat. Only the coworker handling it (or the admin) can SEND / change it.
@@ -537,6 +563,7 @@ async function claimChat(chatId, userId) {
     throw e;
   }
   assignMap.set(chatId, userId);
+  await setPreferred(chatId, userId); // from now on this number's messages come to this person
   return true;
 }
 
@@ -553,6 +580,7 @@ async function endHandling(chatId, status, note) {
 // Send back to the common inbox. We bump unread to 1 so it shows up there again (the inbox lists unread chats).
 async function releaseChat(chatId) {
   const n = await endHandling(chatId, 'released');
+  await clearPreferred(chatId); // giving it back means future messages go to the common inbox again
   if (n) await pool.query('UPDATE chats SET unread_count = GREATEST(unread_count, 1) WHERE id=?', [chatId]);
   return n;
 }
@@ -579,6 +607,7 @@ async function transferChat(chatId, toUserId) {
     );
     await conn.commit();
     assignMap.set(chatId, toUserId);
+    await setPreferred(chatId, toUserId);
     return true;
   } catch (e) {
     await conn.rollback();
@@ -762,6 +791,7 @@ async function startSock() {
         await pool.query('DELETE FROM messages WHERE chat_id=?', [id]);
         await pool.query('DELETE FROM chats WHERE id=?', [id]);
         await endHandling(id, 'released');
+        await clearPreferred(id);
         emitToChat(id, 'chat-deleted', id);
       }
     }));
@@ -772,6 +802,13 @@ async function startSock() {
         if (otpMsgIds.has(raw.key?.id)) continue;
         const msg = await addMessage(raw);
         if (!msg) continue;
+        // A number somebody takes care of: a new message from it goes straight to them (not to the common inbox)
+        if (type === 'notify' && !msg.fromMe && !assignMap.has(msg.chatId)) {
+          const owner = usersCache.get(prefMap.get(msg.chatId));
+          if (owner && owner.active && owner.role === 'agent') {
+            await claimChat(msg.chatId, owner.id).catch((e) => console.warn('auto-assign failed:', e.message));
+          }
+        }
         emitToChat(msg.chatId, 'message', msg);
         emitChat(msg.chatId);
         // Save incoming media right away, because WhatsApp media links expire
@@ -836,8 +873,6 @@ io.on('connection', (socket) => {
 
 app.get('/health', (req, res) => res.json({ status: 'ok', ready: isReady }));
 
-// Public, no login: shows the QR while WhatsApp is not linked, so anyone can link it
-app.get('/link/status', (req, res) => res.json({ ready: isReady, qr: isReady ? null : latestQr }));
 // ── login with a code sent over WhatsApp ──
 app.post('/auth/request-otp', wrap(async (req, res) => {
   const phone = normPhone(req.body.phone);
@@ -878,6 +913,8 @@ app.post('/auth/verify-otp', wrap(async (req, res) => {
 
 // Everything below needs a logged-in user (your old /send-* routes need the x-api-key header instead)
 app.use(requireAuth);
+// Everything under /admin is admin-only, including any route added later
+app.use('/admin', requireAdmin);
 
 app.get('/auth/me', (req, res) => res.json({ success: true, user: req.user, ready: isReady }));
 app.post('/auth/logout', wrap(async (req, res) => {
@@ -987,6 +1024,7 @@ app.patch('/admin/users/:id', requireAdmin, wrap(async (req, res) => {
   if (b.active !== undefined && !b.active) {
     await dropAccess(id);
     await releaseAllOf(id); // their chats go back to the common inbox
+    await clearPreferredOf(id);
   }
   await loadCaches();
   res.json({ success: true });
@@ -998,6 +1036,7 @@ app.delete('/admin/users/:id', requireAdmin, wrap(async (req, res) => {
   if (!u || u.role === 'admin') return res.status(404).json({ success: false, message: 'Coworker not found' });
   await dropAccess(id);
   await releaseAllOf(id);
+  await clearPreferredOf(id);
   await pool.query('DELETE FROM users WHERE id=?', [id]); // handling history stays for the dashboard
   await loadCaches();
   res.json({ success: true });
@@ -1055,6 +1094,8 @@ app.post('/whatsapp/logout', requireAdmin, wrap(async (req, res) => {
   for (const t of ['reactions', 'messages', 'contacts', 'chats']) await pool.query(`DELETE FROM ${t}`);
   await pool.query("UPDATE handlings SET status='released', active_chat=NULL, closed_at=? WHERE status='active'", [Date.now()]);
   assignMap.clear();
+  await pool.query('DELETE FROM preferred_owners');
+  prefMap.clear();
   res.json({ success: true, message: 'WhatsApp disconnected and local data cleared. Scan a new QR code to reconnect.' });
   startSock();
 }));
