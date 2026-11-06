@@ -1151,9 +1151,10 @@ app.post('/whatsapp/logout', requireAdmin, wrap(async (req, res) => {
 /* ───────────────────────── reading ───────────────────────── */
 
 // Admin gets every chat. Everyone else gets the unread ones (common inbox) plus the chats they handle.
+// Only chats with unread messages are listed (for everyone, admin included).
 app.get('/chats', wrap(async (req, res) => {
   const all = await getChats();
-  const chats = req.user.role === 'admin' ? all : all.filter((c) => c.unreadCount > 0 || c.assignedTo?.id === req.user.id);
+  const chats = all.filter((c) => c.unreadCount > 0);
   res.json({ success: true, chats });
 }));
 
