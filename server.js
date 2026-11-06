@@ -434,22 +434,70 @@ const deny = (chatId) => {
 // Who may send into a chat?  The coworker who claimed it, or the admin.
 // Typing a brand-new phone number in "My chats" claims it automatically if nobody has it yet.
 async function resolveTarget(input, user) {
-  if (!input) throw Object.assign(new Error('chatId / phoneNumber is required'), { status: 400 });
+  if (!input) {
+    throw Object.assign(
+      new Error('chatId / phoneNumber is required'),
+      { status: 400 }
+    );
+  }
+
   const check = async (jid, autoClaim) => {
     if (!user || canSend(user, jid)) return;
-    if (autoClaim && !assignMap.has(jid) && (await claimChat(jid, user.id))) return;
+
+    if (
+      autoClaim &&
+      !assignMap.has(jid) &&
+      (await claimChat(jid, user.id))
+    ) {
+      return;
+    }
+
     throw deny(jid);
   };
+
+  // If the input is already a WhatsApp JID
   if (String(input).includes('@')) {
-    await check(String(input), false);
-    return String(input);
+    const directJid = String(input);
+
+    console.log('\n📤 RECIPIENT DEBUG');
+    console.log('Input supplied by UI:', input);
+    console.log('Input is already a JID:', directJid);
+    console.log('Final recipient JID used for sending:', directJid);
+
+    await check(directJid, false);
+    return directJid;
   }
+
+  // Convert phone number into WhatsApp JID
   const jid = toJid(input);
-  if (user && assignMap.has(jid)) await check(jid, false);
+
+  console.log('\n📤 RECIPIENT DEBUG');
+  console.log('Input supplied by UI:', input);
+  console.log('Generated JID:', jid);
+
+  if (user && assignMap.has(jid)) {
+    await check(jid, false);
+  }
+
+  // Resolve recipient through WhatsApp
   const [found] = await sock.onWhatsApp(jid);
-  if (!found?.exists) throw Object.assign(new Error('This number is not registered on WhatsApp'), { status: 400 });
+
+  console.log('WhatsApp registered:', found?.exists);
+  console.log('Resolved JID from Baileys:', found?.jid || '(none)');
+
+  if (!found?.exists) {
+    throw Object.assign(
+      new Error('This number is not registered on WhatsApp'),
+      { status: 400 }
+    );
+  }
+
   const final = found.jid || jid;
+
+  console.log('Final recipient JID used for sending:', final);
+
   await check(final, true);
+
   return final;
 }
 
