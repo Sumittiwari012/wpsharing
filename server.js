@@ -228,6 +228,7 @@ async function getReactions(ids) {
 
 function rowToMsg(r, reactions = {}) {
   const m = { ...JSON.parse(r.data), status: r.status || null, deleted: !!r.deleted, reactions, sentBy: r.sent_by ? usersCache.get(r.sent_by)?.name || null : null };
+  m.pushName = null; // also hides profile names of messages stored before this change
   if (r.deleted) {
     m.type = 'deleted';
     m.text = '🚫 This message was deleted';
@@ -262,7 +263,8 @@ function chatRowToJson(r) {
   }
   return {
     id: r.id,
-    name: r.ct_name || r.name || r.ct_notify || (r.id.endsWith('@g.us') ? 'Group' : '+' + numberFromJid(r.id)),
+    // Customers are shown by phone number only (never a contact / profile name). Groups have no number, so they keep the group name.
+    name: r.id.endsWith('@g.us') ? (r.name || 'Group') : '+' + numberFromJid(r.id),
     isGroup: r.id.endsWith('@g.us'),
     unreadCount: Math.max(0, r.unread_count || 0),
     lastMessageTime: r.last_message_time || 0,
@@ -311,7 +313,7 @@ function simplify(raw) {
     chatId: raw.key.remoteJid,
     fromMe: !!raw.key.fromMe,
     sender: raw.key.participant || raw.participant || raw.key.remoteJid,
-    pushName: raw.pushName || null,
+    pushName: null, // we only show numbers, never WhatsApp profile names
     timestamp: toNum(raw.messageTimestamp)
   };
 
@@ -374,10 +376,7 @@ async function addMessage(raw) {
     [jid, m.id, m.timestamp, +m.fromMe, toNum(raw.status), +m.deleted, m.text, JSON.stringify(m), JSON.stringify(raw, BufferJSON.replacer)]
   );
 
-  if (!m.fromMe) {
-    if (m.pushName) await upsertContact(m.sender, { notify: m.pushName });
-    if (jid.endsWith('@g.us')) fillGroupName(jid);
-  }
+  if (!m.fromMe && jid.endsWith('@g.us')) fillGroupName(jid);
   return getMessage(jid, m.id);
 }
 
@@ -544,8 +543,13 @@ async function clearPreferredOf(userId) {
   for (const [c, u] of prefMap) if (u === userId) prefMap.delete(c);
 }
 
-// Anyone logged in can READ any chat. Only the coworker handling it (or the admin) can SEND / change it.
-const canSend = (user, chatId) => user.role === 'admin' || assignMap.get(chatId) === user.id;
+// Anyone logged in can READ any chat (the admin can look into every coworker's chat).
+// Only the coworker handling it can SEND / change it. The admin can act only on chats nobody handles.
+const canSend = (user, chatId) => {
+  const owner = assignMap.get(chatId);
+  if (owner) return owner === user.id;
+  return user.role === 'admin';
+};
 const guardSend = (req, chatId) => {
   if (!canSend(req.user, chatId)) throw deny(chatId);
 };
@@ -880,25 +884,15 @@ app.get('/health', (req, res) => res.json({ status: 'ok', ready: isReady }));
 app.get('/link/status', (req, res) => res.json({ ready: isReady, qr: isReady ? null : latestQr }));
 
 // ── login with a code sent over WhatsApp ──
+// Only numbers that exist in `users` (the admin from ADMIN_PHONE, and coworkers the admin added) can get a code.
+// Any other number gets the same generic reply, but no code is created or sent.
 app.post('/auth/request-otp', wrap(async (req, res) => {
   const phone = normPhone(req.body.phone);
   if (phone.length < 10) return res.status(400).json({ success: false, message: 'Enter your WhatsApp number with country code' });
   if (limited('otp:' + req.ip, 10, 10 * 60 * 1000)) return res.status(429).json({ success: false, message: 'Too many attempts. Try again later.' });
   let [rows] = await pool.query('SELECT id, name, phone, role, active FROM users WHERE phone=?', [phone]);
-  if (!rows[0] && isReady && !limited('new:' + req.ip, 5, 60 * 60 * 1000)) {
-    // Open login: anyone with a WhatsApp number can sign in, no need to be added first.
-    // Until the admin gives them a name, their name is just their number.
-    try {
-      const [found] = await sock.onWhatsApp(toJid(phone));
-      if (found?.exists) {
-        await pool.query("INSERT IGNORE INTO users (name, phone, role, active) VALUES (?,?,'agent',1)", ['+' + phone, phone]);
-        await loadCaches();
-        [rows] = await pool.query('SELECT id, name, phone, role, active FROM users WHERE phone=?', [phone]);
-      }
-    } catch (e) { console.warn('auto-create user failed:', e.message); }
-  }
   if (rows[0] && !rows[0].active) rows = []; // a disabled person stays blocked
-  if (!rows[0]) console.log(`OTP requested for +${phone}: not sent (number not on WhatsApp, WhatsApp not connected, or this user is disabled)`);
+  if (!rows[0]) console.log(`OTP requested for +${phone}: not sent (number was not added by the admin, or this user is disabled)`);
   if (rows[0]) {
     const [o] = await pool.query('SELECT last_sent FROM login_codes WHERE phone=?', [phone]);
     if (!o[0] || Date.now() - o[0].last_sent > 30000) {
@@ -1016,11 +1010,43 @@ app.get('/admin/users', requireAdmin, wrap(async (req, res) => {
   res.json({ success: true, users: rows });
 }));
 
+// Who is handling which numbers right now (read-only overview for the admin).
+// ?userId=N shows only that coworker's numbers. To look inside a chat, open it normally:
+// GET /messages/:chatId works for the admin, but sending / closing / transferring stays with the handler.
+app.get('/admin/handlers', requireAdmin, wrap(async (req, res) => {
+  const uid = Number(req.query.userId) || 0;
+  const [rows] = await pool.query(
+    `SELECT h.chat_id, h.user_id, h.started_at, u.name AS user_name, u.phone AS user_phone,
+            c.name AS chat_name, c.unread_count, c.last_message_time
+       FROM handlings h
+       JOIN users u ON u.id = h.user_id
+       LEFT JOIN chats c ON c.id = h.chat_id
+      WHERE h.status = 'active' ${uid ? 'AND h.user_id = ?' : ''}
+      ORDER BY u.name, c.last_message_time DESC`,
+    uid ? [uid] : []
+  );
+  const chats = rows.map((r) => ({
+    chatId: r.chat_id,
+    name: r.chat_id.endsWith('@g.us') ? (r.chat_name || 'Group') : '+' + numberFromJid(r.chat_id),
+    isGroup: r.chat_id.endsWith('@g.us'),
+    handledBy: { id: r.user_id, name: r.user_name, phone: r.user_phone },
+    since: r.started_at,
+    unreadCount: Math.max(0, r.unread_count || 0),
+    lastMessageTime: r.last_message_time || 0
+  }));
+  const byUser = {};
+  for (const c of chats) {
+    const g = (byUser[c.handledBy.id] ||= { id: c.handledBy.id, name: c.handledBy.name, phone: c.handledBy.phone, chats: [] });
+    g.chats.push({ chatId: c.chatId, name: c.name, since: c.since, unreadCount: c.unreadCount, lastMessageTime: c.lastMessageTime });
+  }
+  res.json({ success: true, total: chats.length, chats, byUser: Object.values(byUser) });
+}));
+
 app.post('/admin/users', requireAdmin, wrap(async (req, res) => {
   const name = String(req.body.name || '').trim();
   const phone = normPhone(req.body.phone);
   if (!name || phone.length < 10) return res.status(400).json({ success: false, message: 'A name and a WhatsApp number (with country code) are required' });
-  // If this number already logged in on its own, this just gives them their name
+  // If this number already exists, this just updates their name and re-enables them
   const [ex] = await pool.query('SELECT id, role FROM users WHERE phone=?', [phone]);
   if (ex[0]) {
     if (ex[0].role === 'admin') return res.status(409).json({ success: false, message: 'That is the admin number' });
@@ -1084,11 +1110,10 @@ app.get('/admin/stats', requireAdmin, wrap(async (req, res) => {
   );
   const [recent] = await pool.query(
     `SELECT h.id, h.chat_id, h.status, h.started_at, h.closed_at,
-            u.name AS user_name, COALESCE(ct.name, c.name, ct.notify) AS name
+            u.name AS user_name, c.name AS name
        FROM handlings h
        LEFT JOIN users u ON u.id = h.user_id
        LEFT JOIN chats c ON c.id = h.chat_id
-       LEFT JOIN contacts ct ON ct.id = h.chat_id
       ORDER BY COALESCE(h.closed_at, h.started_at) DESC
       LIMIT 40`
   );
@@ -1102,7 +1127,8 @@ app.get('/admin/stats', requireAdmin, wrap(async (req, res) => {
     })),
     recent: recent.map((r) => ({
       id: r.id, chatId: r.chat_id, status: r.status, startedAt: r.started_at, closedAt: r.closed_at,
-      user: r.user_name || 'Removed user', name: r.name || '+' + numberFromJid(r.chat_id)
+      user: r.user_name || 'Removed user',
+      name: r.chat_id.endsWith('@g.us') ? (r.name || 'Group') : '+' + numberFromJid(r.chat_id)
     }))
   });
 }));
@@ -1173,10 +1199,10 @@ app.get('/profile-picture/:jid', requireReady, wrap(async (req, res) => {
 }));
 
 app.get('/contacts', requireAdmin, wrap(async (req, res) => {
-  const [rows] = await pool.query("SELECT id, name, notify FROM contacts WHERE id LIKE '%@s.whatsapp.net'");
+  const [rows] = await pool.query("SELECT id FROM contacts WHERE id LIKE '%@s.whatsapp.net'");
   res.json({
     success: true,
-    contacts: rows.map((c) => ({ id: c.id, name: c.name || c.notify || '+' + numberFromJid(c.id), number: numberFromJid(c.id) }))
+    contacts: rows.map((c) => ({ id: c.id, name: '+' + numberFromJid(c.id), number: numberFromJid(c.id) }))
   });
 }));
 
