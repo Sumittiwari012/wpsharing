@@ -167,6 +167,13 @@ async function initDb() {
     attempts INT NOT NULL DEFAULT 0,
     last_sent BIGINT NOT NULL
   ) ${T}`);
+
+  // WhatsApp "LID" ids (1234@lid) -> real phone-number ids (91xxxxxxxxxx@s.whatsapp.net). Filled automatically.
+  await pool.query(`CREATE TABLE IF NOT EXISTS lid_map (
+    lid VARCHAR(80) PRIMARY KEY,
+    pn VARCHAR(80) NOT NULL
+  ) ${T}`);
+
   const adminPhone = normPhone(process.env.ADMIN_PHONE);
   if (adminPhone.length < 10) throw new Error('ADMIN_PHONE is missing in .env (with country code, e.g. 919876543210)');
   await pool.query("UPDATE users SET role='agent', active=0 WHERE role='admin' AND (phone IS NULL OR phone <> ?)", [adminPhone]);
@@ -187,21 +194,127 @@ const toNum = (v) => {
 };
 
 const numberFromJid = (jid) => String(jid).split('@')[0].split(':')[0];
-// Convert LID-based direct chats to phone-number JIDs when Baileys
-// provides the alternate phone-number JID.
-function canonicalChatJid(key) {
-  const remoteJid = String(key?.remoteJid || '');
-  const remoteJidAlt = String(key?.remoteJidAlt || '');
 
-  if (
-    remoteJid.endsWith('@lid') &&
-    remoteJidAlt.endsWith('@s.whatsapp.net')
-  ) {
-    return remoteJidAlt;
+/* ───────────── LID (WhatsApp internal id) → real phone number ─────────────
+   WhatsApp sometimes identifies a customer as 1234@lid instead of 91xxxxxxxxxx@s.whatsapp.net.
+   We always store and use the phone-number id (the "canonical" id) so the number shows correctly
+   and every event (messages, unread counts, ticks, reactions) lands on the same chat. */
+
+const lidMap = new Map(); // 1234@lid -> 91xxxxxxxxxx@s.whatsapp.net
+const bareJid = (j) => {
+  const [u, s] = String(j).split('@');
+  return u.split(':')[0] + '@' + s;
+};
+// Any id from WhatsApp or from the UI -> the id we store. Unknown LIDs stay as they are.
+const canonId = (j) => (j && String(j).endsWith('@lid') ? lidMap.get(bareJid(j)) || String(j) : j);
+// Number to show to the people using the inbox
+const displayNumber = (jid) => numberFromJid(canonId(jid));
+
+let mergeQueue = Promise.resolve();
+const queued = (fn) => (mergeQueue = mergeQueue.then(fn).catch((e) => console.warn('lid task failed:', e.message)));
+
+function canonicalChatJid(key) {
+  const remote = String(key?.remoteJid || '');
+  const alt = String(key?.remoteJidAlt || '');
+  if (remote.endsWith('@lid') && alt.endsWith('@s.whatsapp.net')) {
+    const lid = bareJid(remote);
+    const pn = bareJid(alt);
+    if (lidMap.get(lid) !== pn) learnLid(lid, pn).catch((e) => console.warn('learnLid failed:', e.message));
+    return pn;
+  }
+  return canonId(remote); // uses earlier mappings when this message has no Alt
+}
+
+// Remember a LID → phone-number pair and merge any chat that was already stored under the LID
+async function learnLid(lid, pn) {
+  if (!lid || !pn) return;
+  const l = bareJid(lid);
+  const p = bareJid(pn);
+  if (!l.endsWith('@lid') || !p.endsWith('@s.whatsapp.net')) return;
+  if (lidMap.get(l) !== p) {
+    lidMap.set(l, p);
+    await pool.query('REPLACE INTO lid_map (lid, pn) VALUES (?,?)', [l, p]);
+  }
+  await queued(() => mergeChat(l, p));
+}
+
+// Move everything from the LID chat into the phone-number chat, then remove the LID chat.
+async function mergeChat(from, to) {
+  if (!from || !to || from === to) return;
+  const [srcRows] = await pool.query('SELECT * FROM chats WHERE id=?', [from]);
+  if (!srcRows[0]) return;
+  const src = srcRows[0];
+
+  await pool.query('INSERT IGNORE INTO chats (id) VALUES (?)', [to]);
+  await pool.query(
+    'UPDATE chats SET unread_count = unread_count + ?, last_message_time = GREATEST(last_message_time, ?), pinned = GREATEST(pinned, ?) WHERE id=?',
+    [src.unread_count || 0, src.last_message_time || 0, src.pinned || 0, to]
+  );
+
+  // Messages (the chatId and mediaUrl stored inside each message are rewritten too)
+  const [msgs] = await pool.query('SELECT id, data FROM messages WHERE chat_id=?', [from]);
+  for (const m of msgs) {
+    let data;
+    try {
+      data = JSON.parse(m.data);
+      data.chatId = to;
+      if (data.mediaUrl) data.mediaUrl = `/media/${encodeURIComponent(to)}/${encodeURIComponent(m.id)}`;
+    } catch (_) { data = null; }
+    try {
+      if (data) await pool.query('UPDATE messages SET chat_id=?, data=? WHERE chat_id=? AND id=?', [to, JSON.stringify(data), from, m.id]);
+      else await pool.query('UPDATE messages SET chat_id=? WHERE chat_id=? AND id=?', [to, from, m.id]);
+    } catch (e) {
+      if (e.code === 'ER_DUP_ENTRY') await pool.query('DELETE FROM messages WHERE chat_id=? AND id=?', [from, m.id]);
+      else throw e;
+    }
   }
 
-  return remoteJid;
+  // Who is handling it
+  if (assignMap.has(from)) {
+    if (assignMap.has(to)) {
+      await endHandling(from, 'released');
+    } else {
+      await pool.query('UPDATE handlings SET active_chat=? WHERE active_chat=?', [to, from]);
+      assignMap.set(to, assignMap.get(from));
+      assignMap.delete(from);
+    }
+  }
+  await pool.query('UPDATE handlings SET chat_id=? WHERE chat_id=?', [to, from]);
+  if (prefMap.has(from)) {
+    if (!prefMap.has(to)) await setPreferred(to, prefMap.get(from));
+    await clearPreferred(from);
+  }
+
+  await pool.query('DELETE FROM chats WHERE id=?', [from]);
+  console.log(`Merged chat ${from} into ${to}`);
+  emitToChat(from, 'chat-deleted', from);
+  await emitChat(to);
 }
+
+// Run after WhatsApp connects: finds the phone number of every chat still stored under a LID and merges it.
+async function backfillLids() {
+  const [rows] = await pool.query("SELECT id FROM chats WHERE id LIKE '%@lid'");
+  for (const c of rows) {
+    let pn = lidMap.get(c.id) || null;
+    if (!pn) {
+      const [ms] = await pool.query('SELECT raw FROM messages WHERE chat_id=? ORDER BY ts DESC LIMIT 30', [c.id]);
+      for (const m of ms) {
+        try {
+          const k = JSON.parse(m.raw, BufferJSON.reviver).key;
+          if (k?.remoteJidAlt && String(k.remoteJidAlt).endsWith('@s.whatsapp.net')) { pn = bareJid(k.remoteJidAlt); break; }
+        } catch (_) { /* skip */ }
+      }
+    }
+    if (!pn) {
+      try {
+        const r = await sock?.signalRepository?.lidMapping?.getPNForLID(c.id);
+        if (r) pn = bareJid(r);
+      } catch (_) { /* mapping not available */ }
+    }
+    if (pn) await learnLid(c.id, pn);
+  }
+}
+
 async function upsertChat(id, f = {}) {
   await pool.query('INSERT IGNORE INTO chats (id) VALUES (?)', [id]);
   const sets = [];
@@ -278,7 +391,7 @@ function chatRowToJson(r) {
   return {
     id: r.id,
     // Customers are shown by phone number only (never a contact / profile name). Groups have no number, so they keep the group name.
-    name: r.id.endsWith('@g.us') ? (r.name || 'Group') : '+' + numberFromJid(r.id),
+    name: r.id.endsWith('@g.us') ? (r.name || 'Group') : '+' + displayNumber(r.id),
     isGroup: r.id.endsWith('@g.us'),
     unreadCount: Math.max(0, r.unread_count || 0),
     lastMessageTime: r.last_message_time || 0,
@@ -379,7 +492,7 @@ async function addMessage(raw) {
   if (!jid || jid === 'status@broadcast' || !raw.message) return null;
   raw.messageTimestamp = toNum(raw.messageTimestamp) || Math.floor(Date.now() / 1000);
 
-  const m = simplify(raw);
+  const m = simplify(raw, jid);
   if (!m) return null;
 
   await upsertChat(jid, { lastMessageTime: m.timestamp });
@@ -449,69 +562,35 @@ const deny = (chatId) => {
 // Typing a brand-new phone number in "My chats" claims it automatically if nobody has it yet.
 async function resolveTarget(input, user) {
   if (!input) {
-    throw Object.assign(
-      new Error('chatId / phoneNumber is required'),
-      { status: 400 }
-    );
+    throw Object.assign(new Error('chatId / phoneNumber is required'), { status: 400 });
   }
 
   const check = async (jid, autoClaim) => {
     if (!user || canSend(user, jid)) return;
-
-    if (
-      autoClaim &&
-      !assignMap.has(jid) &&
-      (await claimChat(jid, user.id))
-    ) {
-      return;
-    }
-
+    if (autoClaim && !assignMap.has(jid) && (await claimChat(jid, user.id))) return;
     throw deny(jid);
   };
 
-  // If the input is already a WhatsApp JID
+  // The input is already a WhatsApp id (an old LID id from the UI is converted to the phone-number id)
   if (String(input).includes('@')) {
-    const directJid = String(input);
-
-    console.log('\n📤 RECIPIENT DEBUG');
-    console.log('Input supplied by UI:', input);
-    console.log('Input is already a JID:', directJid);
-    console.log('Final recipient JID used for sending:', directJid);
-
+    const directJid = canonId(String(input));
+    console.log('📤 Recipient (id given):', input, '->', directJid);
     await check(directJid, false);
     return directJid;
   }
 
-  // Convert phone number into WhatsApp JID
+  // A phone number was typed
   const jid = toJid(input);
+  if (user && assignMap.has(jid)) await check(jid, false);
 
-  console.log('\n📤 RECIPIENT DEBUG');
-  console.log('Input supplied by UI:', input);
-  console.log('Generated JID:', jid);
-
-  if (user && assignMap.has(jid)) {
-    await check(jid, false);
-  }
-
-  // Resolve recipient through WhatsApp
   const [found] = await sock.onWhatsApp(jid);
-
-  console.log('WhatsApp registered:', found?.exists);
-  console.log('Resolved JID from Baileys:', found?.jid || '(none)');
-
+  console.log('📤 Recipient (number given):', input, '| registered:', found?.exists, '| Baileys jid:', found?.jid || '(none)');
   if (!found?.exists) {
-    throw Object.assign(
-      new Error('This number is not registered on WhatsApp'),
-      { status: 400 }
-    );
+    throw Object.assign(new Error('This number is not registered on WhatsApp'), { status: 400 });
   }
 
-  const final = found.jid || jid;
-
-  console.log('Final recipient JID used for sending:', final);
-
+  const final = canonId(found.jid || jid);
   await check(final, true);
-
   return final;
 }
 
@@ -522,11 +601,11 @@ async function sendAndStore(jid, content, quotedId, media, userId) {
   let msg = await addMessage(sent);
   if (msg && media?.buffer && MEDIA_TYPES.includes(msg.type)) await writeMedia(msg, media.buffer);
   if (msg && userId) {
-    await pool.query('UPDATE messages SET sent_by=? WHERE chat_id=? AND id=?', [userId, jid, msg.id]);
-    msg = await getMessage(jid, msg.id);
+    await pool.query('UPDATE messages SET sent_by=? WHERE chat_id=? AND id=?', [userId, msg.chatId, msg.id]);
+    msg = await getMessage(msg.chatId, msg.id);
   }
-  if (msg) emitToChat(jid, 'message', msg);
-  emitChat(jid);
+  if (msg) emitToChat(msg.chatId, 'message', msg);
+  emitChat(msg ? msg.chatId : jid);
   return msg;
 }
 
@@ -590,6 +669,9 @@ async function loadCaches() {
   const [prefs] = await pool.query('SELECT chat_id, user_id FROM preferred_owners');
   prefMap.clear();
   prefs.forEach((a) => prefMap.set(a.chat_id, a.user_id));
+  const [lids] = await pool.query('SELECT lid, pn FROM lid_map');
+  lidMap.clear();
+  lids.forEach((r) => lidMap.set(r.lid, r.pn));
 }
 
 async function setPreferred(chatId, userId) {
@@ -768,7 +850,7 @@ async function startSock() {
       logger,
       printQRInTerminal: false,
       markOnlineOnConnect: false,
-      getMessage: async (key) => (await getRaw(key.remoteJid, key.id))?.message || undefined
+      getMessage: async (key) => (await getRaw(canonicalChatJid(key), key.id))?.message || undefined
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -793,6 +875,8 @@ async function startSock() {
         latestQr = null;
         io.emit('ready', true);
         console.log('✅ WhatsApp connected');
+        // Fix chats that were saved under a LID id: find their phone number and merge them
+        backfillLids().catch((e) => console.warn('lid backfill failed:', e.message));
       }
       if (connection === 'close') {
         isReady = false;
@@ -809,11 +893,15 @@ async function startSock() {
       }
     });
 
+    // WhatsApp tells us which LID belongs to which phone number
+    sock.ev.on('lid-mapping.update', safe(async ({ lid, pn }) => { await learnLid(lid, pn); }));
+
     // History WhatsApp sends right after you link the device
-    sock.ev.on('messaging-history.set', safe(async ({ chats = [], contacts = [], messages = [] }) => {
+    sock.ev.on('messaging-history.set', safe(async ({ chats = [], contacts = [], messages = [], lidPnMappings = [] }) => {
+      for (const m of lidPnMappings) await learnLid(m.lid, m.pn);
       for (const c of contacts) await upsertContact(c.id, { name: c.name, notify: c.notify });
       for (const c of chats) {
-        await upsertChat(c.id, {
+        await upsertChat(canonId(c.id), {
           name: c.name,
           unreadCount: c.unreadCount,
           archived: c.archived != null ? !!c.archived : undefined,
@@ -830,18 +918,20 @@ async function startSock() {
 
     sock.ev.on('chats.upsert', safe(async (list) => {
       for (const c of list) {
-        await upsertChat(c.id, {
+        const id = canonId(c.id);
+        await upsertChat(id, {
           name: c.name,
           unreadCount: c.unreadCount,
           archived: c.archived != null ? !!c.archived : undefined,
           pinned: c.pinned != null ? toNum(c.pinned) > 0 : undefined
         });
-        emitChat(c.id);
+        emitChat(id);
       }
     }));
     sock.ev.on('chats.update', safe(async (list) => {
       for (const u of list) {
         if (!u.id) continue;
+        const id = canonId(u.id);
         // Baileys sends unreadCount as a delta when > 0, absolute otherwise
         const f = {
           name: u.name,
@@ -850,12 +940,13 @@ async function startSock() {
         };
         if (u.unreadCount > 0) f.unreadDelta = u.unreadCount;
         else if (u.unreadCount === 0) f.unreadCount = 0;
-        await upsertChat(u.id, f);
-        emitChat(u.id);
+        await upsertChat(id, f);
+        emitChat(id);
       }
     }));
     sock.ev.on('chats.delete', safe(async (ids) => {
-      for (const id of ids) {
+      for (const rawId of ids) {
+        const id = canonId(rawId);
         await pool.query('DELETE FROM messages WHERE chat_id=?', [id]);
         await pool.query('DELETE FROM chats WHERE id=?', [id]);
         await endHandling(id, 'released');
@@ -889,19 +980,21 @@ async function startSock() {
     // Delivery ticks (sent → delivered → read) and deletes
     sock.ev.on('messages.update', safe(async (updates) => {
       for (const { key, update } of updates) {
+        const chatId = canonicalChatJid(key);
         if (update.status != null) {
-          await pool.query('UPDATE messages SET status = GREATEST(status, ?) WHERE chat_id=? AND id=?', [update.status, key.remoteJid, key.id]);
+          await pool.query('UPDATE messages SET status = GREATEST(status, ?) WHERE chat_id=? AND id=?', [update.status, chatId, key.id]);
         }
         if (update.messageStubType === WAMessageStubType.REVOKE) {
-          await pool.query('UPDATE messages SET deleted=1 WHERE chat_id=? AND id=?', [key.remoteJid, key.id]);
+          await pool.query('UPDATE messages SET deleted=1 WHERE chat_id=? AND id=?', [chatId, key.id]);
         }
-        const msg = await getMessage(key.remoteJid, key.id);
+        const msg = await getMessage(chatId, key.id);
         if (msg) emitToChat(msg.chatId, 'message-update', msg);
       }
     }));
 
     sock.ev.on('messages.reaction', safe(async (list) => {
       for (const { key, reaction } of list) {
+        const chatId = canonicalChatJid(key);
         const reactor = reaction.key?.fromMe ? 'me' : reaction.key?.participant || reaction.key?.remoteJid;
         if (reaction.text) {
           await pool.query('INSERT INTO reactions (message_id, reactor, emoji) VALUES (?,?,?) ON DUPLICATE KEY UPDATE emoji=VALUES(emoji)', [key.id, reactor, reaction.text]);
@@ -909,11 +1002,14 @@ async function startSock() {
           await pool.query('DELETE FROM reactions WHERE message_id=? AND reactor=?', [key.id, reactor]);
         }
         const r = await getReactions([key.id]);
-        emitToChat(key.remoteJid, 'message-update', { id: key.id, chatId: key.remoteJid, reactions: r[key.id] || {} });
+        emitToChat(chatId, 'message-update', { id: key.id, chatId, reactions: r[key.id] || {} });
       }
     }));
 
-    sock.ev.on('presence.update', ({ id, presences }) => emitToChat(id, 'presence', { chatId: id, presences }));
+    sock.ev.on('presence.update', ({ id, presences }) => {
+      const chatId = canonId(id);
+      emitToChat(chatId, 'presence', { chatId, presences });
+    });
   } catch (err) {
     console.error('startSock() failed:', err);
     isStarting = false;
@@ -1010,7 +1106,7 @@ app.get('/team', wrap(async (req, res) => {
 
 // Take a chat from the common inbox. Whoever is first wins; everybody else sees "handled by <name>".
 app.post('/chats/claim', wrap(async (req, res) => {
-  const { chatId } = req.body;
+  const chatId = canonId(req.body.chatId);
   if (!chatId) return res.status(400).json({ success: false, message: 'chatId is required' });
   const [ex] = await pool.query('SELECT 1 FROM chats WHERE id=?', [chatId]);
   if (!ex[0]) return res.status(404).json({ success: false, message: 'Chat not found' });
@@ -1026,7 +1122,8 @@ app.post('/chats/claim', wrap(async (req, res) => {
 
 // Order finished: outcome = "cleared" (order done) or "cancelled". The chat leaves your list.
 app.post('/chats/close', wrap(async (req, res) => {
-  const { chatId, outcome, note } = req.body;
+  const { outcome, note } = req.body;
+  const chatId = canonId(req.body.chatId);
   if (!['cleared', 'cancelled'].includes(outcome)) return res.status(400).json({ success: false, message: 'outcome must be "cleared" or "cancelled"' });
   guardSend(req, chatId);
   if (!(await endHandling(chatId, outcome, note))) return res.status(404).json({ success: false, message: 'Nobody is handling this chat' });
@@ -1036,7 +1133,7 @@ app.post('/chats/close', wrap(async (req, res) => {
 
 // Hand over to another coworker: the chat moves from your list to theirs.
 app.post('/chats/transfer', wrap(async (req, res) => {
-  const { chatId } = req.body;
+  const chatId = canonId(req.body.chatId);
   const to = Number(req.body.userId);
   guardSend(req, chatId);
   const t = usersCache.get(to);
@@ -1049,7 +1146,7 @@ app.post('/chats/transfer', wrap(async (req, res) => {
 
 // Put back into the common inbox without a result tag
 app.post('/chats/release', wrap(async (req, res) => {
-  const { chatId } = req.body;
+  const chatId = canonId(req.body.chatId);
   guardSend(req, chatId);
   if (!(await releaseChat(chatId))) return res.status(404).json({ success: false, message: 'Nobody is handling this chat' });
   await emitChat(chatId);
@@ -1089,7 +1186,7 @@ app.get('/admin/handlers', requireAdmin, wrap(async (req, res) => {
   );
   const chats = rows.map((r) => ({
     chatId: r.chat_id,
-    name: r.chat_id.endsWith('@g.us') ? (r.chat_name || 'Group') : '+' + numberFromJid(r.chat_id),
+    name: r.chat_id.endsWith('@g.us') ? (r.chat_name || 'Group') : '+' + displayNumber(r.chat_id),
     isGroup: r.chat_id.endsWith('@g.us'),
     handledBy: { id: r.user_id, name: r.user_name, phone: r.user_phone },
     since: r.started_at,
@@ -1190,7 +1287,7 @@ app.get('/admin/stats', requireAdmin, wrap(async (req, res) => {
     recent: recent.map((r) => ({
       id: r.id, chatId: r.chat_id, status: r.status, startedAt: r.started_at, closedAt: r.closed_at,
       user: r.user_name || 'Removed user',
-      name: r.chat_id.endsWith('@g.us') ? (r.name || 'Group') : '+' + numberFromJid(r.chat_id)
+      name: r.chat_id.endsWith('@g.us') ? (r.name || 'Group') : '+' + displayNumber(r.chat_id)
     }))
   });
 }));
@@ -1201,7 +1298,8 @@ app.post('/whatsapp/logout', requireAdmin, wrap(async (req, res) => {
   await fs.promises.rm(AUTH_FOLDER, { recursive: true, force: true });
   await fs.promises.rm(MEDIA_DIR, { recursive: true, force: true });
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
-  for (const t of ['reactions', 'messages', 'contacts', 'chats']) await pool.query(`DELETE FROM ${t}`);
+  for (const t of ['reactions', 'messages', 'contacts', 'chats', 'lid_map']) await pool.query(`DELETE FROM ${t}`);
+  lidMap.clear();
   await pool.query("UPDATE handlings SET status='released', active_chat=NULL, closed_at=? WHERE status='active'", [Date.now()]);
   assignMap.clear();
   await pool.query('DELETE FROM preferred_owners');
@@ -1212,7 +1310,6 @@ app.post('/whatsapp/logout', requireAdmin, wrap(async (req, res) => {
 
 /* ───────────────────────── reading ───────────────────────── */
 
-// Admin gets every chat. Everyone else gets the unread ones (common inbox) plus the chats they handle.
 // Only chats with unread messages are listed (for everyone, admin included).
 app.get('/chats', wrap(async (req, res) => {
   const all = await getChats();
@@ -1222,11 +1319,12 @@ app.get('/chats', wrap(async (req, res) => {
 
 // ?limit=50&before=<unix timestamp> for scrolling up
 app.get('/messages/:chatId', wrap(async (req, res) => {
+  const chatId = canonId(req.params.chatId);
   const limit = Math.min(parseInt(req.query.limit) || 50, 200);
   const before = parseInt(req.query.before) || 9999999999999;
   const [rows] = await pool.query(
     'SELECT * FROM messages WHERE chat_id=? AND ts<? ORDER BY ts DESC LIMIT ?',
-    [req.params.chatId, before, limit + 1]
+    [chatId, before, limit + 1]
   );
   const hasMore = rows.length > limit;
   const page = rows.slice(0, limit).reverse();
@@ -1236,9 +1334,10 @@ app.get('/messages/:chatId', wrap(async (req, res) => {
 
 // Media: served from disk (downloaded on demand if missing). ?download=1 forces download
 app.get('/media/:chatId/:id', wrap(async (req, res) => {
-  const raw = await getRaw(req.params.chatId, req.params.id);
+  const chatId = canonId(req.params.chatId);
+  const raw = await getRaw(chatId, req.params.id);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
-  const msg = simplify(raw, req.params.chatId);
+  const msg = simplify(raw, chatId);
   if (!msg || !MEDIA_TYPES.includes(msg.type)) return res.status(400).json({ success: false, message: 'Message has no media' });
 
   const [rows] = await pool.query('SELECT media_path FROM messages WHERE chat_id=? AND id=?', [msg.chatId, msg.id]);
@@ -1310,7 +1409,8 @@ app.post('/send/location', requireReady, wrap(async (req, res) => {
 }));
 
 app.post('/react', requireReady, wrap(async (req, res) => {
-  const { chatId, messageId, emoji } = req.body;
+  const { messageId, emoji } = req.body;
+  const chatId = canonId(req.body.chatId);
   guardSend(req, chatId);
   const raw = await getRaw(chatId, messageId);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
@@ -1326,19 +1426,21 @@ app.post('/react', requireReady, wrap(async (req, res) => {
 }));
 
 app.post('/forward', requireReady, wrap(async (req, res) => {
-  const { fromChatId, messageId, toChatId } = req.body;
+  const { messageId } = req.body;
+  const fromChatId = canonId(req.body.fromChatId);
   const raw = await getRaw(fromChatId, messageId);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
-  const jid = await resolveTarget(toChatId, req.user);
+  const jid = await resolveTarget(req.body.toChatId, req.user);
   const sent = await sock.sendMessage(jid, { forward: raw });
   const msg = await addMessage(sent);
-  if (msg) emitToChat(jid, 'message', msg);
-  emitChat(jid);
+  if (msg) emitToChat(msg.chatId, 'message', msg);
+  emitChat(msg ? msg.chatId : jid);
   res.json({ success: true, message: msg });
 }));
 
 app.post('/delete', requireReady, wrap(async (req, res) => {
-  const { chatId, messageId, forEveryone } = req.body;
+  const { messageId, forEveryone } = req.body;
+  const chatId = canonId(req.body.chatId);
   guardSend(req, chatId);
   const raw = await getRaw(chatId, messageId);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
@@ -1357,7 +1459,7 @@ app.post('/delete', requireReady, wrap(async (req, res) => {
 
 // Only the person handling the chat marks it read (previewing from the inbox does NOT)
 app.post('/read', requireReady, wrap(async (req, res) => {
-  const { chatId } = req.body;
+  const chatId = canonId(req.body.chatId);
   guardSend(req, chatId);
   await markRead(chatId);
   emitChat(chatId);
@@ -1366,13 +1468,14 @@ app.post('/read', requireReady, wrap(async (req, res) => {
 
 // state: "composing" | "recording" | "paused" | "available" | "unavailable"
 app.post('/presence', requireReady, wrap(async (req, res) => {
-  guardSend(req, req.body.chatId);
-  await sock.sendPresenceUpdate(req.body.state || 'composing', req.body.chatId);
+  const chatId = canonId(req.body.chatId);
+  guardSend(req, chatId);
+  await sock.sendPresenceUpdate(req.body.state || 'composing', chatId);
   res.json({ success: true });
 }));
 
 app.post('/presence/subscribe', requireReady, wrap(async (req, res) => {
-  await sock.presenceSubscribe(req.body.chatId);
+  await sock.presenceSubscribe(canonId(req.body.chatId));
   res.json({ success: true });
 }));
 
