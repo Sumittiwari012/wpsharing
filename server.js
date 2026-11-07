@@ -700,12 +700,12 @@ async function clearPreferredOf(userId) {
   for (const [c, u] of prefMap) if (u === userId) prefMap.delete(c);
 }
 
-// Anyone logged in can READ any chat (the admin can look into every coworker's chat).
-// Only the coworker handling it can SEND / change it. The admin can act only on chats nobody handles.
+// Anyone logged in can READ any chat they open.
+// A coworker can SEND / change only the chats they handle. The admin can act on every chat
+// (continue the conversation, close it, or hand it to a coworker).
 const canSend = (user, chatId) => {
-  const owner = assignMap.get(chatId);
-  if (owner) return owner === user.id;
-  return user.role === 'admin';
+  if (user.role === 'admin') return true;
+  return assignMap.get(chatId) === user.id;
 };
 const guardSend = (req, chatId) => {
   if (!canSend(req.user, chatId)) throw deny(chatId);
@@ -1153,8 +1153,15 @@ app.post('/chats/transfer', wrap(async (req, res) => {
   guardSend(req, chatId);
   const t = usersCache.get(to);
   if (!t || t.role === 'admin' || !t.active) return res.status(400).json({ success: false, message: 'Choose an active coworker' });
-  if (assignMap.get(chatId) === to) return res.status(400).json({ success: false, message: 'That coworker already has this chat' });
-  if (!(await transferChat(chatId, to))) return res.status(404).json({ success: false, message: 'Nobody is handling this chat' });
+  const current = assignMap.get(chatId);
+  if (current === to) return res.status(400).json({ success: false, message: 'That coworker already has this chat' });
+  if (current) {
+    if (!(await transferChat(chatId, to))) return res.status(404).json({ success: false, message: 'Nobody is handling this chat' });
+  } else if (!(await claimChat(chatId, to))) { // nobody had it yet: assign it straight to the coworker
+    return res.status(409).json({ success: false, message: 'Could not assign this chat' });
+  }
+  // When the admin hands a chat over, make sure it shows up in the coworker's list (which lists unread chats)
+  if (req.user.role === 'admin') await pool.query('UPDATE chats SET unread_count = GREATEST(unread_count, 1) WHERE id=?', [chatId]);
   await emitChat(chatId);
   res.json({ success: true });
 }));
@@ -1325,10 +1332,11 @@ app.post('/whatsapp/logout', requireAdmin, wrap(async (req, res) => {
 
 /* ───────────────────────── reading ───────────────────────── */
 
-// Only chats with unread messages are listed (for everyone, admin included).
+// The admin gets every chat (each one carries `assignedTo` = which coworker is talking to that client).
+// Everyone else gets only the chats with unread messages.
 app.get('/chats', wrap(async (req, res) => {
   const all = await getChats();
-  const chats = all.filter((c) => c.unreadCount > 0);
+  const chats = req.user.role === 'admin' ? all : all.filter((c) => c.unreadCount > 0);
   res.json({ success: true, chats });
 }));
 
