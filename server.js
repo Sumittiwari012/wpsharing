@@ -174,6 +174,19 @@ async function initDb() {
     pn VARCHAR(80) NOT NULL
   ) ${T}`);
 
+  // Small key/value table for one-time housekeeping jobs
+  await pool.query(`CREATE TABLE IF NOT EXISTS app_meta (
+    k VARCHAR(60) PRIMARY KEY,
+    v VARCHAR(100) NOT NULL
+  ) ${T}`);
+  // One time only: chats that were already unread before this version are cleared, so the inbox starts with NEW messages only.
+  const [resetDone] = await pool.query("SELECT 1 FROM app_meta WHERE k='unread_reset_v1'");
+  if (!resetDone[0]) {
+    await pool.query('UPDATE chats SET unread_count = 0');
+    await pool.query("INSERT INTO app_meta (k, v) VALUES ('unread_reset_v1', '1')");
+    console.log('Old unread counts cleared (one time). The inbox now lists only new incoming messages.');
+  }
+
   const adminPhone = normPhone(process.env.ADMIN_PHONE);
   if (adminPhone.length < 10) throw new Error('ADMIN_PHONE is missing in .env (with country code, e.g. 919876543210)');
   await pool.query("UPDATE users SET role='agent', active=0 WHERE role='admin' AND (phone IS NULL OR phone <> ?)", [adminPhone]);
@@ -903,7 +916,7 @@ async function startSock() {
       for (const c of chats) {
         await upsertChat(canonId(c.id), {
           name: c.name,
-          unreadCount: c.unreadCount,
+          // unreadCount is NOT imported: only new incoming messages count as unread
           archived: c.archived != null ? !!c.archived : undefined,
           pinned: c.pinned != null ? toNum(c.pinned) > 0 : undefined,
           lastMessageTime: toNum(c.conversationTimestamp)
@@ -921,7 +934,7 @@ async function startSock() {
         const id = canonId(c.id);
         await upsertChat(id, {
           name: c.name,
-          unreadCount: c.unreadCount,
+          // unreadCount is NOT imported: only new incoming messages count as unread
           archived: c.archived != null ? !!c.archived : undefined,
           pinned: c.pinned != null ? toNum(c.pinned) > 0 : undefined
         });
@@ -932,14 +945,14 @@ async function startSock() {
       for (const u of list) {
         if (!u.id) continue;
         const id = canonId(u.id);
-        // Baileys sends unreadCount as a delta when > 0, absolute otherwise
         const f = {
           name: u.name,
           archived: u.archived != null ? !!u.archived : undefined,
           pinned: u.pinned != null ? toNum(u.pinned) > 0 : undefined
         };
-        if (u.unreadCount > 0) f.unreadDelta = u.unreadCount;
-        else if (u.unreadCount === 0) f.unreadCount = 0;
+        // Unread is counted by us from new incoming messages (see messages.upsert), so WhatsApp's increments are ignored.
+        // A reset to 0 (chat read on the phone) still clears it.
+        if (u.unreadCount === 0) f.unreadCount = 0;
         await upsertChat(id, f);
         emitChat(id);
       }
@@ -968,6 +981,8 @@ async function startSock() {
             await claimChat(msg.chatId, owner.id).catch((e) => console.warn('auto-assign failed:', e.message));
           }
         }
+        // New incoming message = +1 unread. Chats that were already unread before are never added to the inbox.
+        if (type === 'notify' && !msg.fromMe) await upsertChat(msg.chatId, { unreadDelta: 1 });
         emitToChat(msg.chatId, 'message', msg);
         emitChat(msg.chatId);
         // Save incoming media right away, because WhatsApp media links expire
