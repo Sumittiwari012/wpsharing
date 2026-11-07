@@ -73,6 +73,8 @@ async function initDb() {
     pinned TINYINT NOT NULL DEFAULT 0,
     archived TINYINT NOT NULL DEFAULT 0
   ) ${T}`);
+  // Speeds up "chats with unread messages" lookups (inbox, stats)
+  try { await pool.query('ALTER TABLE chats ADD KEY idx_unread (unread_count)'); } catch (_) { /* already exists */ }
   await pool.query(`CREATE TABLE IF NOT EXISTS contacts (
     id VARCHAR(80) PRIMARY KEY,
     name VARCHAR(255) NULL,
@@ -180,10 +182,10 @@ async function initDb() {
     v VARCHAR(100) NOT NULL
   ) ${T}`);
   // One time only: chats that were already unread before this version are cleared, so the inbox starts with NEW messages only.
-  const [resetDone] = await pool.query("SELECT 1 FROM app_meta WHERE k='unread_reset_v1'");
+  const [resetDone] = await pool.query("SELECT 1 FROM app_meta WHERE k='unread_reset_v2'");
   if (!resetDone[0]) {
     await pool.query('UPDATE chats SET unread_count = 0');
-    await pool.query("INSERT INTO app_meta (k, v) VALUES ('unread_reset_v1', '1')");
+    await pool.query("INSERT INTO app_meta (k, v) VALUES ('unread_reset_v2', '1')");
     console.log('Old unread counts cleared (one time). The inbox now lists only new incoming messages.');
   }
 
@@ -415,7 +417,22 @@ function chatRowToJson(r) {
   };
 }
 
-async function getChats(onlyJid) {
+// onlyJid: a single chat.
+// view:
+//   'inbox' = NEW incoming messages only: unread AND not claimed by anybody
+//   'mine'  = chats claimed by userId (they stay in the list even when read, so the conversation continues normally)
+//   'all'   = every chat (admin overview, and used by emitChat for live updates)
+async function getChats(onlyJid, view = 'all', userId = 0) {
+  const where = ["c.id <> 'status@broadcast'"];
+  const params = [];
+  if (onlyJid) { where.push('c.id = ?'); params.push(onlyJid); }
+  if (view === 'inbox') {
+    where.push('c.unread_count > 0');
+    where.push('NOT EXISTS (SELECT 1 FROM handlings h WHERE h.active_chat = c.id)');
+  } else if (view === 'mine') {
+    where.push('EXISTS (SELECT 1 FROM handlings h WHERE h.active_chat = c.id AND h.user_id = ?)');
+    params.push(userId);
+  }
   const [rows] = await pool.query(
     `SELECT c.id, c.name, c.unread_count, c.last_message_time, c.pinned, c.archived,
             ct.name AS ct_name, ct.notify AS ct_notify,
@@ -423,8 +440,8 @@ async function getChats(onlyJid) {
        FROM chats c
        JOIN messages m ON m.chat_id = c.id AND m.ts = (SELECT MAX(ts) FROM messages WHERE chat_id = c.id)
        LEFT JOIN contacts ct ON ct.id = c.id
-      WHERE c.id <> 'status@broadcast' ${onlyJid ? 'AND c.id = ?' : ''}`,
-    onlyJid ? [onlyJid] : []
+      WHERE ${where.join(' AND ')}`,
+    params
   );
   const seen = new Set();
   const out = [];
@@ -500,7 +517,9 @@ function simplify(raw, canonicalChatId = canonicalChatJid(raw?.key)) {
   return out;
 }
 
-async function addMessage(raw) {
+// silent = true is used for bulk history imports: it stores the message but skips the extra
+// read-back query (getMessage), which nobody needs while importing thousands of old messages.
+async function addMessage(raw, silent = false) {
   const jid = canonicalChatJid(raw?.key);
   if (!jid || jid === 'status@broadcast' || !raw.message) return null;
   raw.messageTimestamp = toNum(raw.messageTimestamp) || Math.floor(Date.now() / 1000);
@@ -517,6 +536,7 @@ async function addMessage(raw) {
   );
 
   if (!m.fromMe && jid.endsWith('@g.us')) fillGroupName(jid);
+  if (silent) return m;
   return getMessage(jid, m.id);
 }
 
@@ -545,7 +565,8 @@ const extFor = (m) => {
 
 async function writeMedia(m, buffer) {
   const rel = m.id.replace(/[^\w-]/g, '_') + '.' + extFor(m);
-  fs.writeFileSync(path.join(MEDIA_DIR, rel), buffer);
+  // Async write: a large file no longer freezes every other request while it is being saved
+  await fs.promises.writeFile(path.join(MEDIA_DIR, rel), buffer);
   await pool.query('UPDATE messages SET media_path=? WHERE chat_id=? AND id=?', [rel, m.chatId, m.id]);
   return path.join(MEDIA_DIR, rel);
 }
@@ -667,15 +688,18 @@ const safeEq = (a, b) => {
 
 const OTP_TTL = 5 * 60 * 1000;
 const SESSION_TTL = 10 * 365 * 24 * 3600 * 1000; // ~10 years
+const AUTH_CACHE_TTL = 60 * 1000; // a login is re-checked against the database at most once a minute
 const assignMap = new Map();   // chat jid -> user id of the coworker handling it right now
 const prefMap = new Map();     // chat jid -> user id who takes care of this number (gets its future messages)
 const usersCache = new Map();  // user id -> { id, name, email, phone, role, active }
+const authCache = new Map();   // token hash -> { user, exp }
 const otpMsgIds = new Set();   // OTP messages we sent over WhatsApp (not stored as chats)
 
 async function loadCaches() {
   const [users] = await pool.query('SELECT id, name, email, phone, role, active FROM users');
   usersCache.clear();
   users.forEach((u) => usersCache.set(u.id, u));
+  authCache.clear(); // user details / roles may have changed
   const [rows] = await pool.query("SELECT chat_id, user_id FROM handlings WHERE status='active'");
   assignMap.clear();
   rows.forEach((a) => assignMap.set(a.chat_id, a.user_id));
@@ -738,7 +762,7 @@ async function endHandling(chatId, status, note) {
   return r.affectedRows;
 }
 
-// Send back to the common inbox. We bump unread to 1 so it shows up there again (the inbox lists unread chats).
+// Send back to the common inbox. We bump unread to 1 so it shows up there again (the inbox lists unread, unclaimed chats).
 async function releaseChat(chatId) {
   const n = await endHandling(chatId, 'released');
   await clearPreferred(chatId); // giving it back means future messages go to the common inbox again
@@ -778,8 +802,12 @@ async function transferChat(chatId, toUserId) {
   }
 }
 
+// Marks a chat read. Only as many recent incoming messages are loaded as the chat has unread
+// (at least 1, at most 100) instead of always reading and parsing 100 stored messages.
 async function markRead(chatId) {
-  const [rows] = await pool.query('SELECT raw FROM messages WHERE chat_id=? AND from_me=0 ORDER BY ts DESC LIMIT 100', [chatId]);
+  const [c] = await pool.query('SELECT unread_count FROM chats WHERE id=?', [chatId]);
+  const n = Math.min(Math.max(c[0]?.unread_count || 0, 1), 100);
+  const [rows] = await pool.query('SELECT raw FROM messages WHERE chat_id=? AND from_me=0 ORDER BY ts DESC LIMIT ?', [chatId, n]);
   const keys = rows.map((r) => JSON.parse(r.raw, BufferJSON.reviver).key);
   if (keys.length && sock && isReady) await sock.readMessages(keys);
   await upsertChat(chatId, { unreadCount: 0 });
@@ -790,14 +818,22 @@ function emitToChat(chatId, event, payload) {
   io.emit(event, payload);
 }
 
+// Cached for AUTH_CACHE_TTL so a chat full of images does not run one login query per image.
+// Logout, disabling or deleting a user, and any user change clear the cache (see loadCaches / dropAccess / logout).
 async function userFromToken(token) {
   if (!token) return null;
+  const h = sha(token);
+  const hit = authCache.get(h);
+  if (hit && hit.exp > Date.now()) return hit.user;
   const [rows] = await pool.query(
     `SELECT u.id, u.name, u.email, u.phone, u.role FROM sessions s JOIN users u ON u.id = s.user_id
       WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1`,
-    [sha(token), Date.now()]
+    [h, Date.now()]
   );
-  return rows[0] || null;
+  const user = rows[0] || null;
+  if (user) authCache.set(h, { user, exp: Date.now() + AUTH_CACHE_TTL });
+  else authCache.delete(h);
+  return user;
 }
 
 const tokenOf = (req) => (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.query.token || '';
@@ -826,7 +862,10 @@ async function sendOtp(user, code) {
   const text = `Your login code is ${code}. It expires in 5 minutes. Do not share it with anyone.`;
   if (isReady && sock) {
     const m = await sock.sendMessage(toJid(user.phone), { text });
-    if (m?.key?.id) otpMsgIds.add(m.key.id);
+    if (m?.key?.id) {
+      otpMsgIds.add(m.key.id);
+      setTimeout(() => otpMsgIds.delete(m.key.id), 60 * 1000); // only needed for a moment; keeps the set from growing forever
+    }
     console.log(`OTP sent to +${user.phone} over WhatsApp`);
     return 'whatsapp';
   }
@@ -898,10 +937,13 @@ async function startSock() {
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
         console.log('Connection closed. Status code:', statusCode, 'Reconnecting:', shouldReconnect);
         isStarting = false;
-        if (shouldReconnect) startSock();
-        else {
+        if (shouldReconnect) {
+          // Wait a few seconds so a flapping connection (e.g. the same login open on two servers)
+          // cannot make the server reconnect in a tight loop
+          setTimeout(() => startSock(), 5000);
+        } else {
           await fs.promises.rm(AUTH_FOLDER, { recursive: true, force: true });
-          startSock();
+          setTimeout(() => startSock(), 2000);
         }
       }
     });
@@ -922,7 +964,7 @@ async function startSock() {
           lastMessageTime: toNum(c.conversationTimestamp)
         });
       }
-      for (const m of messages) await addMessage(m);
+      for (const m of messages) await addMessage(m, true); // silent: no read-back query per old message
       io.to('admin').emit('history-synced', { chats: chats.length, messages: messages.length });
     }));
 
@@ -1105,7 +1147,9 @@ app.use('/admin', requireAdmin);
 
 app.get('/auth/me', (req, res) => res.json({ success: true, user: req.user, ready: isReady }));
 app.post('/auth/logout', wrap(async (req, res) => {
-  await pool.query('DELETE FROM sessions WHERE token_hash=?', [sha(tokenOf(req))]);
+  const h = sha(tokenOf(req));
+  authCache.delete(h);
+  await pool.query('DELETE FROM sessions WHERE token_hash=?', [h]);
   res.json({ success: true });
 }));
 
@@ -1160,8 +1204,7 @@ app.post('/chats/transfer', wrap(async (req, res) => {
   } else if (!(await claimChat(chatId, to))) { // nobody had it yet: assign it straight to the coworker
     return res.status(409).json({ success: false, message: 'Could not assign this chat' });
   }
-  // When the admin hands a chat over, make sure it shows up in the coworker's list (which lists unread chats)
-  if (req.user.role === 'admin') await pool.query('UPDATE chats SET unread_count = GREATEST(unread_count, 1) WHERE id=?', [chatId]);
+  // (No unread bump needed any more: "My chats" lists every chat the coworker handles, read or unread.)
   await emitChat(chatId);
   res.json({ success: true });
 }));
@@ -1179,6 +1222,7 @@ app.post('/chats/release', wrap(async (req, res) => {
 
 const dropAccess = async (id) => {
   await pool.query('DELETE FROM sessions WHERE user_id=?', [id]);
+  authCache.clear(); // their cached logins must stop working immediately
   io.in('user:' + id).disconnectSockets(true);
 };
 
@@ -1298,10 +1342,15 @@ app.get('/admin/stats', requireAdmin, wrap(async (req, res) => {
       ORDER BY COALESCE(h.closed_at, h.started_at) DESC
       LIMIT 40`
   );
-  const unclaimed = (await getChats()).filter((c) => c.unreadCount > 0 && !c.assignedTo).length;
+  // Counted in SQL (was: load every chat with its last message, then count in JavaScript)
+  const [[{ n: unclaimed }]] = await pool.query(
+    `SELECT COUNT(*) AS n FROM chats c
+      WHERE c.unread_count > 0 AND c.id <> 'status@broadcast'
+        AND NOT EXISTS (SELECT 1 FROM handlings h WHERE h.active_chat = c.id)`
+  );
   res.json({
     success: true,
-    unclaimed,
+    unclaimed: Number(unclaimed),
     agents: rows.map((r) => ({
       id: r.id, name: r.name, phone: r.phone, active: !!r.active,
       following: Number(r.following), cleared: Number(r.cleared), cancelled: Number(r.cancelled), transferred: Number(r.transferred)
@@ -1332,11 +1381,16 @@ app.post('/whatsapp/logout', requireAdmin, wrap(async (req, res) => {
 
 /* ───────────────────────── reading ───────────────────────── */
 
-// The admin gets every chat (each one carries `assignedTo` = which coworker is talking to that client).
-// Everyone else gets only the chats with unread messages.
+// GET /chats?view=inbox -> only NEW incoming chats: unread AND unclaimed
+// GET /chats?view=mine  -> only chats I am handling (they stay even when read / unread = 0)
+// The admin without ?view gets every chat (each one carries `assignedTo` = which coworker is talking to that client).
 app.get('/chats', wrap(async (req, res) => {
-  const all = await getChats();
-  const chats = req.user.role === 'admin' ? all : all.filter((c) => c.unreadCount > 0);
+  const view = req.query.view;
+  let chats;
+  if (view === 'inbox') chats = await getChats(null, 'inbox');
+  else if (view === 'mine') chats = await getChats(null, 'mine', req.user.id);
+  else if (req.user.role === 'admin') chats = await getChats(null, 'all');
+  else return res.status(400).json({ success: false, message: 'view must be "inbox" or "mine"' });
   res.json({ success: true, chats });
 }));
 
@@ -1532,6 +1586,19 @@ app.post('/send-image', requireReady, wrap(async (req, res) => {
   await sendAndStore(await resolveTarget(phoneNumber), { image: { url: String(imageUrl) }, caption: caption ? String(caption) : undefined });
   res.json({ success: true, message: 'Image sent successfully' });
 }));
+
+/* ───────────────────────── housekeeping ───────────────────────── */
+
+// Every 10 minutes: drop old rate-limit entries and cap the caches that would otherwise only ever grow.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, list] of hits) {
+    if (!list.length || now - list[list.length - 1] > 10 * 60 * 1000) hits.delete(k);
+  }
+  for (const [k, v] of authCache) if (v.exp <= now) authCache.delete(k);
+  if (Object.keys(picCache).length > 1000) for (const k of Object.keys(picCache)) delete picCache[k];
+  if (groupNameTried.size > 5000) groupNameTried.clear();
+}, 10 * 60 * 1000).unref();
 
 /* ───────────────────────── start ───────────────────────── */
 
