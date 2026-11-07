@@ -187,7 +187,21 @@ const toNum = (v) => {
 };
 
 const numberFromJid = (jid) => String(jid).split('@')[0].split(':')[0];
+// Convert LID-based direct chats to phone-number JIDs when Baileys
+// provides the alternate phone-number JID.
+function canonicalChatJid(key) {
+  const remoteJid = String(key?.remoteJid || '');
+  const remoteJidAlt = String(key?.remoteJidAlt || '');
 
+  if (
+    remoteJid.endsWith('@lid') &&
+    remoteJidAlt.endsWith('@s.whatsapp.net')
+  ) {
+    return remoteJidAlt;
+  }
+
+  return remoteJid;
+}
 async function upsertChat(id, f = {}) {
   await pool.query('INSERT IGNORE INTO chats (id) VALUES (?)', [id]);
   const sets = [];
@@ -306,11 +320,11 @@ async function emitChat(jid) {
 
 const MEDIA_TYPES = ['image', 'video', 'audio', 'document', 'sticker'];
 
-function simplify(raw) {
+function simplify(raw, canonicalChatId = canonicalChatJid(raw?.key)) {
   if (!raw || !raw.key) return null;
   const base = {
     id: raw.key.id,
-    chatId: raw.key.remoteJid,
+    chatId: canonicalChatId,
     fromMe: !!raw.key.fromMe,
     sender: raw.key.participant || raw.participant || raw.key.remoteJid,
     pushName: null, // we only show numbers, never WhatsApp profile names
@@ -361,7 +375,7 @@ function simplify(raw) {
 }
 
 async function addMessage(raw) {
-  const jid = raw?.key?.remoteJid;
+  const jid = canonicalChatJid(raw?.key);
   if (!jid || jid === 'status@broadcast' || !raw.message) return null;
   raw.messageTimestamp = toNum(raw.messageTimestamp) || Math.floor(Date.now() / 1000);
 
@@ -1224,7 +1238,7 @@ app.get('/messages/:chatId', wrap(async (req, res) => {
 app.get('/media/:chatId/:id', wrap(async (req, res) => {
   const raw = await getRaw(req.params.chatId, req.params.id);
   if (!raw) return res.status(404).json({ success: false, message: 'Message not found' });
-  const msg = simplify(raw);
+  const msg = simplify(raw, req.params.chatId);
   if (!msg || !MEDIA_TYPES.includes(msg.type)) return res.status(400).json({ success: false, message: 'Message has no media' });
 
   const [rows] = await pool.query('SELECT media_path FROM messages WHERE chat_id=? AND id=?', [msg.chatId, msg.id]);
